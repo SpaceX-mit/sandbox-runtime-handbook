@@ -6,6 +6,8 @@ import { request as httpsRequest } from 'node:https'
 import { connect } from 'node:net'
 import { URL } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
+import type { MitmCA } from './mitm-ca.js'
+import { terminateAndForward } from './tls-terminate-proxy.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
   connectViaParentProxy,
@@ -31,6 +33,20 @@ export interface HttpProxyServerOptions {
    * If returns undefined, the request will be handled directly.
    */
   getMitmSocketPath?(host: string): string | undefined
+
+  /**
+   * If present, CONNECT requests are TLS-terminated in-process and the
+   * decrypted HTTP forwarded upstream over real TLS, instead of opening an
+   * opaque byte tunnel. Mutually exclusive with getMitmSocketPath at the
+   * config layer (sandbox-manager rejects both being set).
+   */
+  mitmCA?: MitmCA
+
+  /**
+   * Additional trusted CA(s) for the terminating proxy's outbound TLS leg.
+   * Unset → system roots + NODE_EXTRA_CA_CERTS. Primarily a test seam.
+   */
+  tlsTerminateUpstreamCA?: string | Buffer | Array<string | Buffer>
 
   /**
    * Optional upstream HTTP proxy. When present, direct-connect traffic (i.e.
@@ -82,7 +98,23 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         return
       }
 
-      // Decide upstream route: MITM unix socket > parent HTTP proxy > direct.
+      // Decide upstream route:
+      //   in-process TLS termination
+      //   > external MITM unix socket
+      //   > parent HTTP proxy
+      //   > direct
+      // (tlsTerminate and mitmProxy are mutually exclusive at the config
+      // layer, so the first two never both apply.)
+      if (options.mitmCA) {
+        if (clientGone) return
+        terminateAndForward(options.mitmCA, socket, head, {
+          hostname,
+          port,
+          upstreamCA: options.tlsTerminateUpstreamCA,
+        })
+        return
+      }
+
       const mitmSocketPath = options.getMitmSocketPath?.(hostname)
       const parentUrl =
         !mitmSocketPath &&
