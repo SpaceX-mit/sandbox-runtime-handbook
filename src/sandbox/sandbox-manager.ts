@@ -198,6 +198,7 @@ async function startHttpProxyServer(
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
     getMitmSocketPath,
+    mitmCA,
     parentProxy,
   })
 
