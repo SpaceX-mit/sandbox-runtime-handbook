@@ -10,10 +10,9 @@
 
 use clap::{Args, Parser, Subcommand};
 
-/// Default group name. Mirrors `srt_win::wfp::DEFAULT_GROUP_NAME`;
-/// duplicated here so the CLI struct definitions (which are not
-/// `#[cfg(windows)]`-gated) compile on non-Windows hosts where the
-/// library crate is empty.
+/// Default group name. Lives here (not in the `#[cfg(windows)]`
+/// library crate) so the clap-derive CLI structs compile on
+/// non-Windows hosts where the library is empty.
 const DEFAULT_GROUP_NAME: &str = "sandbox-runtime-net";
 
 #[derive(Parser)]

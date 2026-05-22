@@ -43,6 +43,7 @@ use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSe
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use srt_win::sid::LocalPsid;
+use srt_win::util::wstr;
 use srt_win::wfp::{sddl_group, sddl_nonmember, SDDL_EVERYONE};
 
 /// `BUILTIN\Administrators`. Reliably present-and-enabled on the
@@ -59,10 +60,6 @@ const ABSENT_GROUP_SID: &str = "S-1-5-32-9999";
 /// `CC` in SDDL is `ADS_RIGHT_DS_CREATE_CHILD` = bit 0. The filters
 /// only need a single bit; `AccessCheck` is asked for that bit.
 const DESIRED_ACCESS: u32 = 1;
-
-fn wstr(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
 
 /// Open an impersonation-level duplicate of the current process
 /// token — `AccessCheck` requires an impersonation token.

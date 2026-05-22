@@ -89,11 +89,8 @@ use windows::Win32::Security::{
 };
 
 use crate::sid;
-use crate::util::{from_pwstr, pcwstr, wstr};
+use crate::util::{pcwstr, wstr};
 
-/// Default group name. Overridable via `--name` so an embedding
-/// product (or enterprise rollout) can pick its own.
-pub const DEFAULT_GROUP_NAME: &str = "sandbox-runtime-net";
 const GROUP_COMMENT: &str = "sandbox-runtime network sandbox membership";
 
 /// Default sublayer GUID. Stable so uninstall can find filters from a
@@ -273,16 +270,6 @@ impl FilterTag {
     }
 }
 
-/// Summary of one filter under our sublayer (for `wfp status`).
-#[derive(Debug, Serialize, Clone)]
-pub struct FilterSummary {
-    pub filter_key: String,
-    pub layer: &'static str,
-    pub action: &'static str,
-    pub name: String,
-    pub tag: Option<FilterTag>,
-}
-
 // ────────────────────── local group management ──────────────────────
 
 /// Create the local group if it doesn't exist and add `user_sid` to
@@ -353,19 +340,21 @@ const ALE_LAYERS: [(GUID, &str); 2] = [
     (FWPM_LAYER_ALE_AUTH_CONNECT_V6, "ale_auth_connect_v6"),
 ];
 
-/// Enumerate every filter in `sublayer` at the two ALE connect layers.
-/// Returns summaries; `tag` is `Some` only for filters carrying a
-/// parseable `srt-win` providerData tag.
-pub fn enumerate_filters(sublayer: &GUID) -> Result<Vec<FilterSummary>> {
-    let engine = EngineHandle::open()?;
-    enumerate_in(&engine, sublayer)
-}
-
-fn enumerate_in(
+/// Walk every filter at the two ALE connect layers under
+/// `sublayer` that carries a parseable `srt-win` providerData tag,
+/// invoking `f(layer_name, filterKey, &tag)` for each. Owns the
+/// enum-handle and per-batch `FwpmFreeMemory0` lifecycle so callers
+/// don't duplicate the unsafe FFI walk.
+///
+/// Errors are propagated (with the enum handle destroyed first) —
+/// don't swallow them: inside `install_filters`' txn, a missed enum
+/// error would skip stale-filter cleanup and the fresh set would be
+/// added on top, growing the filter count every install.
+fn for_each_tagged_filter(
     engine: &EngineHandle,
     sublayer: &GUID,
-) -> Result<Vec<FilterSummary>> {
-    let mut out = Vec::new();
+    mut f: impl FnMut(&'static str, GUID, &FilterTag),
+) -> Result<()> {
     for (layer, layer_name) in ALE_LAYERS {
         let mut tmpl = FWPM_FILTER_ENUM_TEMPLATE0::default();
         tmpl.layerKey = layer;
@@ -390,7 +379,9 @@ fn enumerate_in(
                 unsafe {
                     let _ = FwpmFilterDestroyEnumHandle0(engine.h(), h);
                 }
-                return Err(anyhow!("FwpmFilterEnum0: 0x{rc:08x}"));
+                return Err(anyhow!(
+                    "FwpmFilterEnum0({layer_name}): 0x{rc:08x}"
+                ));
             }
             if n == 0 {
                 if !entries.is_null() {
@@ -406,39 +397,30 @@ fn enumerate_in(
                 if fp.is_null() {
                     continue;
                 }
-                let f = unsafe { &*fp };
-                if &f.subLayerKey != sublayer {
+                let flt = unsafe { &*fp };
+                if &flt.subLayerKey != sublayer {
                     continue;
                 }
-                let action = if f.action.r#type == FWP_ACTION_PERMIT {
-                    "permit"
-                } else if f.action.r#type == FWP_ACTION_BLOCK {
-                    "block"
-                } else {
-                    "other"
-                };
-                let tag = if f.providerData.size > 0
-                    && !f.providerData.data.is_null()
+                if flt.providerData.size == 0
+                    || flt.providerData.data.is_null()
                 {
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            f.providerData.data,
-                            f.providerData.size as usize,
-                        )
-                    };
-                    serde_json::from_slice::<FilterTag>(bytes)
-                        .ok()
-                        .filter(|t| t.tool == "srt-win")
-                } else {
-                    None
+                    continue;
+                }
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        flt.providerData.data,
+                        flt.providerData.size as usize,
+                    )
                 };
-                out.push(FilterSummary {
-                    filter_key: format!("{:?}", f.filterKey),
-                    layer: layer_name,
-                    action,
-                    name: from_pwstr(f.displayData.name),
-                    tag,
-                });
+                if let Ok(tag) = serde_json::from_slice::<FilterTag>(bytes)
+                    && tag.tool == "srt-win"
+                {
+                    // `tag` is owned (parsed from bytes); the
+                    // `flt`/`bytes` borrows are released before
+                    // FwpmFreeMemory0 below, so no FFI lifetime
+                    // hazard for the closure.
+                    f(layer_name, flt.filterKey, &tag);
+                }
             }
             unsafe {
                 FwpmFreeMemory0(&mut (entries as *mut c_void));
@@ -451,7 +433,7 @@ fn enumerate_in(
             let _ = FwpmFilterDestroyEnumHandle0(engine.h(), h);
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Delete every srt-win-tagged filter under `sublayer`. Returns the
@@ -460,97 +442,22 @@ fn delete_tagged_filters(
     engine: &EngineHandle,
     sublayer: &GUID,
 ) -> Result<usize> {
-    // Re-enumerate to get filterKey GUIDs (the summary stringifies
-    // them; here we need the raw GUID so walk again).
+    // Collect across both layers, then delete. Deletion is by global
+    // filterKey GUID inside one txn, so per-layer ordering is not
+    // load-bearing.
+    let mut to_delete: Vec<GUID> = Vec::new();
+    for_each_tagged_filter(engine, sublayer, |_, key, _| {
+        to_delete.push(key);
+    })?;
     let mut deleted = 0usize;
-    for (layer, _name) in ALE_LAYERS {
-        let mut tmpl = FWPM_FILTER_ENUM_TEMPLATE0::default();
-        tmpl.layerKey = layer;
-        tmpl.enumType = FWP_FILTER_ENUM_OVERLAPPING;
-        tmpl.actionMask = 0xFFFF_FFFF;
-        let mut h = HANDLE::default();
-        let rc = unsafe {
-            FwpmFilterCreateEnumHandle0(engine.h(), Some(&tmpl), &mut h)
-        };
-        if rc != 0 {
+    for key in to_delete {
+        let rc = unsafe { FwpmFilterDeleteByKey0(engine.h(), &key) };
+        if rc == 0 {
+            deleted += 1;
+        } else if rc != FWP_E_FILTER_NOT_FOUND {
             return Err(anyhow!(
-                "FwpmFilterCreateEnumHandle0: 0x{rc:08x}"
+                "FwpmFilterDeleteByKey0({key:?}): 0x{rc:08x}"
             ));
-        }
-        let mut to_delete: Vec<GUID> = Vec::new();
-        loop {
-            let mut entries: *mut *mut FWPM_FILTER0 = std::ptr::null_mut();
-            let mut n: u32 = 0;
-            let rc = unsafe {
-                FwpmFilterEnum0(engine.h(), h, 256, &mut entries, &mut n)
-            };
-            if rc != 0 {
-                // Don't silently break: inside install_filters' txn,
-                // a swallowed enum error would skip stale-filter
-                // cleanup and the fresh six would be added on top,
-                // growing the set every install.
-                unsafe {
-                    let _ = FwpmFilterDestroyEnumHandle0(engine.h(), h);
-                }
-                return Err(anyhow!("FwpmFilterEnum0: 0x{rc:08x}"));
-            }
-            if n == 0 {
-                if !entries.is_null() {
-                    unsafe {
-                        FwpmFreeMemory0(&mut (entries as *mut c_void));
-                    }
-                }
-                break;
-            }
-            let slice =
-                unsafe { std::slice::from_raw_parts(entries, n as usize) };
-            for &fp in slice {
-                if fp.is_null() {
-                    continue;
-                }
-                let f = unsafe { &*fp };
-                if &f.subLayerKey != sublayer {
-                    continue;
-                }
-                let matches = if f.providerData.size > 0
-                    && !f.providerData.data.is_null()
-                {
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            f.providerData.data,
-                            f.providerData.size as usize,
-                        )
-                    };
-                    serde_json::from_slice::<FilterTag>(bytes)
-                        .ok()
-                        .map(|t| t.tool == "srt-win")
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
-                if matches {
-                    to_delete.push(f.filterKey);
-                }
-            }
-            unsafe {
-                FwpmFreeMemory0(&mut (entries as *mut c_void));
-            }
-            if (n as usize) < 256 {
-                break;
-            }
-        }
-        unsafe {
-            let _ = FwpmFilterDestroyEnumHandle0(engine.h(), h);
-        }
-        for key in to_delete {
-            let rc = unsafe { FwpmFilterDeleteByKey0(engine.h(), &key) };
-            if rc == 0 {
-                deleted += 1;
-            } else if rc != FWP_E_FILTER_NOT_FOUND {
-                return Err(anyhow!(
-                    "FwpmFilterDeleteByKey0({key:?}): 0x{rc:08x}"
-                ));
-            }
         }
     }
     Ok(deleted)
@@ -854,21 +761,24 @@ pub struct WfpStatus {
 }
 
 pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
-    let all = enumerate_filters(sublayer)?;
-    let mine: Vec<_> = all.iter().filter(|f| f.tag.is_some()).collect();
-    let has = |k: &str| {
-        mine.iter()
-            .any(|f| f.tag.as_ref().map(|t| t.kind == k).unwrap_or(false))
-    };
-    let state = if has("permit-group") && has("block") {
+    let engine = EngineHandle::open()?;
+    let mut filters = 0usize;
+    let mut have_permit_group = false;
+    let mut have_block = false;
+    for_each_tagged_filter(&engine, sublayer, |_, _, tag| {
+        filters += 1;
+        match tag.kind.as_str() {
+            "permit-group" => have_permit_group = true,
+            "block" => have_block = true,
+            _ => {}
+        }
+    })?;
+    let state = if have_permit_group && have_block {
         "installed"
     } else {
         "absent"
     };
-    Ok(WfpStatus {
-        state,
-        filters: mine.len(),
-    })
+    Ok(WfpStatus { state, filters })
 }
 
 /// Parse a `--sublayer-guid` argument. Accepts braced or unbraced
