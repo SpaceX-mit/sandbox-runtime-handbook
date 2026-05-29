@@ -277,15 +277,33 @@ Invoke-WithEnv 'HTTP_PROXY' "http://127.0.0.1:$PortLo" {
 Write-Host 'E5b ok: broker restores the lowercase twin of proxy vars for the child'
 
 # ── E6: self-protect — child cannot OpenProcess the broker ──────
-# `launch::run` exports the broker PID. The child P/Invokes
-# OpenProcess directly with PROCESS_VM_READ — an unambiguous mask
-# that the broker-only DACL must deny. (`.NET Process.Handle`
+# The child discovers the broker by walking its parent-process chain
+# by NAME (the depth differs between cmd / powershell / git-bash
+# children, so no fixed hop count). Win32_Process.ParentProcessId is
+# readable without any handle on the broker itself, so discovery does
+# not depend on the access self-protect denies. The probe then
+# P/Invokes OpenProcess directly with PROCESS_VM_READ — an unambiguous
+# mask that the broker-only DACL must deny. (`.NET Process.Handle`
 # is NOT sufficient: it lazily falls back to
 # PROCESS_QUERY_LIMITED_INFORMATION, which can succeed via paths
 # the DACL doesn't fully gate; that produced a false "OPENED"
 # on the previous CI run.)
 $probe = @'
-$bp = [int]$env:SANDBOX_RUNTIME_WIN_BROKER_PID
+$bp = 0
+$why = ''
+$cur = $PID
+for ($i = 0; $i -lt 6; $i++) {
+  $p = Get-CimInstance Win32_Process -Filter "ProcessId=$cur" -ErrorAction SilentlyContinue
+  if (-not $p) { $why = "WMI query failed at pid $cur (hop $i)"; break }
+  if ($p.Name -eq 'srt-win.exe') { $bp = [int]$p.ProcessId; break }
+  if (-not $p.ParentProcessId) { $why = "no parent beyond pid $cur (hop $i)"; break }
+  $cur = $p.ParentProcessId
+}
+if ($bp -eq 0) {
+  if (-not $why) { $why = 'hop cap reached without finding srt-win.exe' }
+  Write-Output "NOBROKER: $why"
+  exit 0
+}
 $sig = '[DllImport("kernel32.dll",SetLastError=true)]public static extern System.IntPtr OpenProcess(uint a,bool b,uint p);'
 $k32 = Add-Type -MemberDefinition $sig -Name K32 -Namespace W -PassThru
 # 0x0010 = PROCESS_VM_READ
@@ -314,6 +332,11 @@ $sddl = ($r.raw -split "`r?`n" |
          Where-Object { $_ -match 'self-protect applied' }) -join ' '
 Write-Host "E6 broker DACL: $sddl"
 Write-Host "E6 probe output: $($r.out.Trim())"
+if ($r.out -match 'NOBROKER') {
+  $reason = ($r.out -split "`r?`n" |
+             Where-Object { $_ -match '^NOBROKER' }) -join ' '
+  throw "E6: broker discovery failed — $reason. raw: $($r.raw)"
+}
 if ($r.out -match 'OPENED:vm_read') {
   throw "E6: child got PROCESS_VM_READ on broker " +
         "(self-protect ineffective). raw: $($r.raw)"

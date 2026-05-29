@@ -341,22 +341,15 @@ pub fn run(spec: &ExecSpec<'_>) -> Result<u32> {
 /// or deduplicated, so if both `HTTP_PROXY` and `http_proxy` are
 /// present both survive into the child.
 ///
-/// Two kinds of entries are added on top of the verbatim copy:
-/// - `SANDBOX_RUNTIME_WIN_BROKER_PID`, which the self-protect smoke
-///   test reads to probe `OpenProcess` against the broker — not
-///   proxy-related.
-/// - The missing-case variants of `*_PROXY` variables (see
-///   [`add_proxy_case_twins`]) — casing repair of caller-provided
-///   values, not proxy synthesis.
+/// The only adjustment on top of the verbatim copy is restoring the
+/// missing-case variants of `*_PROXY` variables (see
+/// [`add_proxy_case_twins`]) — casing repair of caller-provided
+/// values, not proxy synthesis. Nothing else is added: consumers that
+/// need the broker's identity (e.g. the self-protect probe) discover
+/// it by walking the parent-process chain rather than via an
+/// environment variable.
 fn build_env_block() -> Vec<u16> {
     let mut entries: Vec<(String, String)> = std::env::vars().collect();
-
-    // Surface the broker PID so the test suite can verify
-    // self-protect (child tries `OpenProcess(<broker>)` → denied).
-    entries.push((
-        "SANDBOX_RUNTIME_WIN_BROKER_PID".to_string(),
-        std::process::id().to_string(),
-    ));
 
     add_proxy_case_twins(&mut entries);
 
