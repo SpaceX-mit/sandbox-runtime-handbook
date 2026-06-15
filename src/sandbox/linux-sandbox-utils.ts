@@ -39,6 +39,8 @@ export interface LinuxSandboxParams {
   socksSocketPath?: string
   httpProxyPort?: number
   socksProxyPort?: number
+  /** Per-session proxy auth token; embedded in proxy env URLs. */
+  proxyAuthToken?: string
   /** Path to the TLS-termination CA cert; injected as trust env vars. */
   caCertPath?: string
   readConfig?: FsReadRestrictionConfig
@@ -1144,6 +1146,7 @@ export async function wrapCommandWithSandboxLinux(
     socksSocketPath,
     httpProxyPort,
     socksProxyPort,
+    proxyAuthToken,
     caCertPath,
     readConfig,
     writeConfig,
@@ -1247,6 +1250,7 @@ export async function wrapCommandWithSandboxLinux(
           3128, // Internal HTTP listener port
           1080, // Internal SOCKS listener port
           caCertPath,
+          proxyAuthToken,
         )
         bwrapArgs.push(
           ...proxyEnv.flatMap((env: string) => {

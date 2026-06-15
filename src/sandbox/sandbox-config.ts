@@ -119,8 +119,16 @@ export const NetworkConfigSchema = z.object({
     .array(domainPatternSchema)
     .describe('List of allowed domains (e.g., ["github.com", "*.npmjs.org"])'),
   deniedDomains: z
-    .array(domainPatternSchema)
-    .describe('List of denied domains'),
+    .array(z.union([z.literal('*'), domainPatternSchema]))
+    .describe(
+      'List of denied domains. Unlike allowedDomains, a bare "*" is accepted here (deny-all).',
+    ),
+  strictAllowlist: z
+    .boolean()
+    .optional()
+    .describe(
+      'If true, hosts not in allowedDomains are denied without consulting the ask callback. Set this when allowedDomains is policy enforcement, not a prompt-suppression hint.',
+    ),
   allowUnixSockets: z
     .array(z.string())
     .optional()

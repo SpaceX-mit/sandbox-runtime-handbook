@@ -20,6 +20,13 @@ export interface SocksProxyServerOptions {
    * NO_PROXY-matched hosts still connect directly.
    */
   parentProxy?: ResolvedParentProxy
+
+  /**
+   * Per-session token (same value as the HTTP proxy's). When set, the
+   * server requires SOCKS5 username/password auth and only accepts
+   * user "srt" with this token as the password.
+   */
+  proxyAuthToken?: string
 }
 
 export interface SocksProxyWrapper {
@@ -34,6 +41,17 @@ export function createSocksProxyServer(
   options: SocksProxyServerOptions,
 ): SocksProxyWrapper {
   const socksServer = createServer()
+
+  if (options.proxyAuthToken) {
+    socksServer.setAuthHandler((conn, accept, deny) => {
+      if (conn.username === 'srt' && conn.password === options.proxyAuthToken) {
+        accept()
+      } else {
+        logForDebugging('SOCKS auth rejected', { level: 'error' })
+        deny()
+      }
+    })
+  }
 
   socksServer.setRulesetValidator(async conn => {
     try {

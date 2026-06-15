@@ -316,7 +316,12 @@ export function generateProxyEnvVars(
   httpProxyPort?: number,
   socksProxyPort?: number,
   caCertPath?: string,
+  proxyAuthToken?: string,
 ): string[] {
+  // When the proxy requires auth, embed the credential in the URL so clients
+  // send Proxy-Authorization automatically. Only the sandbox child sees this
+  // env, so the token never reaches host processes.
+  const auth = proxyAuthToken ? `srt:${proxyAuthToken}@` : ''
   // Respect the caller-provided temp dir if set, otherwise fall back to
   // /tmp/claude. CLAUDE_CODE_TMPDIR is the current name; CLAUDE_TMPDIR is
   // kept for backwards compatibility (#141).
@@ -354,17 +359,17 @@ export function generateProxyEnvVars(
   envVars.push(`no_proxy=${noProxyAddresses}`)
 
   if (httpProxyPort) {
-    envVars.push(`HTTP_PROXY=http://localhost:${httpProxyPort}`)
-    envVars.push(`HTTPS_PROXY=http://localhost:${httpProxyPort}`)
+    envVars.push(`HTTP_PROXY=http://${auth}localhost:${httpProxyPort}`)
+    envVars.push(`HTTPS_PROXY=http://${auth}localhost:${httpProxyPort}`)
     // Lowercase versions for compatibility with some tools
-    envVars.push(`http_proxy=http://localhost:${httpProxyPort}`)
-    envVars.push(`https_proxy=http://localhost:${httpProxyPort}`)
+    envVars.push(`http_proxy=http://${auth}localhost:${httpProxyPort}`)
+    envVars.push(`https_proxy=http://${auth}localhost:${httpProxyPort}`)
   }
 
   if (socksProxyPort) {
     // Use socks5h:// for proper DNS resolution through proxy
-    envVars.push(`ALL_PROXY=socks5h://localhost:${socksProxyPort}`)
-    envVars.push(`all_proxy=socks5h://localhost:${socksProxyPort}`)
+    envVars.push(`ALL_PROXY=socks5h://${auth}localhost:${socksProxyPort}`)
+    envVars.push(`all_proxy=socks5h://${auth}localhost:${socksProxyPort}`)
 
     // Configure Git to use SSH through the proxy so DNS resolution happens outside the sandbox.
     // ControlMaster/ControlPath are disabled because SSH connection multiplexing breaks inside
@@ -378,7 +383,9 @@ export function generateProxyEnvVars(
     const sshMuxOverride = '-o ControlMaster=no -o ControlPath=none'
     const platform = getPlatform()
     if (platform === 'macos') {
-      // macOS: use BSD nc SOCKS5 proxy support (-X 5 -x)
+      // macOS: use BSD nc SOCKS5 proxy support (-X 5 -x). nc has no SOCKS5
+      // auth, so when proxyAuthToken is set, git-over-ssh fails at the SOCKS
+      // handshake — use git-over-https (HTTP_PROXY carries the credential).
       envVars.push(
         `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
       )
@@ -386,16 +393,19 @@ export function generateProxyEnvVars(
       // Linux: use socat HTTP CONNECT via the HTTP proxy bridge.
       // socat is already a required Linux sandbox dependency, and PROXY: is
       // portable across all socat versions (unlike SOCKS5-CONNECT which needs >= 1.8.0).
+      const socatAuth = proxyAuthToken ? `,proxyauth=srt:${proxyAuthToken}` : ''
       envVars.push(
-        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}'`,
+        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}${socatAuth}'`,
       )
     }
 
     // FTP proxy support (use socks5h for DNS resolution through proxy)
-    envVars.push(`FTP_PROXY=socks5h://localhost:${socksProxyPort}`)
-    envVars.push(`ftp_proxy=socks5h://localhost:${socksProxyPort}`)
+    envVars.push(`FTP_PROXY=socks5h://${auth}localhost:${socksProxyPort}`)
+    envVars.push(`ftp_proxy=socks5h://${auth}localhost:${socksProxyPort}`)
 
-    // rsync proxy support
+    // rsync proxy support — RSYNC_PROXY is host:port only, no userinfo. With
+    // proxy auth on, rsync via this var fails at the CONNECT (407); use SSH
+    // transport or wrap with proxychains instead.
     envVars.push(`RSYNC_PROXY=localhost:${socksProxyPort}`)
 
     // Database tools NOTE: Most database clients don't have built-in proxy support
@@ -404,10 +414,10 @@ export function generateProxyEnvVars(
     // Docker CLI uses HTTP for the API
     // This makes Docker use the HTTP proxy for registry operations
     envVars.push(
-      `DOCKER_HTTP_PROXY=http://localhost:${httpProxyPort || socksProxyPort}`,
+      `DOCKER_HTTP_PROXY=http://${auth}localhost:${httpProxyPort || socksProxyPort}`,
     )
     envVars.push(
-      `DOCKER_HTTPS_PROXY=http://localhost:${httpProxyPort || socksProxyPort}`,
+      `DOCKER_HTTPS_PROXY=http://${auth}localhost:${httpProxyPort || socksProxyPort}`,
     )
 
     // Kubernetes kubectl - uses standard HTTPS_PROXY
@@ -425,6 +435,10 @@ export function generateProxyEnvVars(
       envVars.push(`CLOUDSDK_PROXY_TYPE=http`)
       envVars.push(`CLOUDSDK_PROXY_ADDRESS=localhost`)
       envVars.push(`CLOUDSDK_PROXY_PORT=${httpProxyPort}`)
+      if (proxyAuthToken) {
+        envVars.push(`CLOUDSDK_PROXY_USERNAME=srt`)
+        envVars.push(`CLOUDSDK_PROXY_PASSWORD=${proxyAuthToken}`)
+      }
     }
 
     // Azure CLI - uses HTTPS_PROXY
@@ -434,8 +448,8 @@ export function generateProxyEnvVars(
     // Terraform respects HTTP_PROXY/HTTPS_PROXY which we already set above
 
     // gRPC-based tools - use standard proxy vars
-    envVars.push(`GRPC_PROXY=socks5h://localhost:${socksProxyPort}`)
-    envVars.push(`grpc_proxy=socks5h://localhost:${socksProxyPort}`)
+    envVars.push(`GRPC_PROXY=socks5h://${auth}localhost:${socksProxyPort}`)
+    envVars.push(`grpc_proxy=socks5h://${auth}localhost:${socksProxyPort}`)
   }
 
   // WARNING: Do not set HTTP_PROXY/HTTPS_PROXY to SOCKS URLs when only SOCKS proxy is available

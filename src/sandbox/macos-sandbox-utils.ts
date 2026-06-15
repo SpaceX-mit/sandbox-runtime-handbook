@@ -25,6 +25,8 @@ export interface MacOSSandboxParams {
   needsNetworkRestriction: boolean
   httpProxyPort?: number
   socksProxyPort?: number
+  /** Per-session proxy auth token; embedded in proxy env URLs. */
+  proxyAuthToken?: string
   /** Path to the TLS-termination CA cert; injected as trust env vars. */
   caCertPath?: string
   allowUnixSockets?: string[]
@@ -744,6 +746,7 @@ export function wrapCommandWithSandboxMacOS(
     needsNetworkRestriction,
     httpProxyPort,
     socksProxyPort,
+    proxyAuthToken,
     caCertPath,
     allowUnixSockets,
     allowAllUnixSockets,
@@ -797,6 +800,7 @@ export function wrapCommandWithSandboxMacOS(
     httpProxyPort,
     socksProxyPort,
     caCertPath,
+    proxyAuthToken,
   )
 
   // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work

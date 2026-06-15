@@ -68,10 +68,24 @@ export interface HttpProxyServerOptions {
    * connecting directly. NO_PROXY-matched hosts still connect directly.
    */
   parentProxy?: ResolvedParentProxy
+
+  /**
+   * Per-session bearer token. When set, every CONNECT and absolute-URI
+   * request must carry `Proxy-Authorization: Basic base64("srt:<token>")`
+   * or it gets a 407. Without this, any host process can dial 127.0.0.1
+   * and reach the filter callback.
+   */
+  proxyAuthToken?: string
 }
 
 export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
   const server = createServer()
+
+  const expectedAuth = options.proxyAuthToken
+    ? 'Basic ' + Buffer.from(`srt:${options.proxyAuthToken}`).toString('base64')
+    : undefined
+  const checkAuth = (got: string | undefined): boolean =>
+    !expectedAuth || got === expectedAuth
 
   // Handle CONNECT requests for HTTPS traffic
   server.on('connect', async (req, socket, head) => {
@@ -87,6 +101,13 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
     })
 
     try {
+      if (!checkAuth(req.headers['proxy-authorization'])) {
+        socket.end(
+          'HTTP/1.1 407 Proxy Authentication Required\r\n' +
+            'Proxy-Authenticate: Basic realm="srt"\r\n\r\n',
+        )
+        return
+      }
       const target = parseConnectTarget(req.url!)
       if (!target) {
         logForDebugging(`Invalid CONNECT request: ${req.url}`, {
@@ -218,6 +239,11 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
   // Handle regular HTTP requests
   server.on('request', async (req, res) => {
     try {
+      if (!checkAuth(req.headers['proxy-authorization'])) {
+        res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="srt"' })
+        res.end()
+        return
+      }
       const url = new URL(req.url!)
       const hostname = stripBrackets(url.hostname)
       const port = url.port

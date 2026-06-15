@@ -6,6 +6,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
+import { randomBytes } from 'node:crypto'
 import type { SandboxRuntimeConfig, SeccompConfig } from './sandbox-config.js'
 import type {
   SandboxAskCallback,
@@ -70,6 +71,10 @@ let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 let parentProxy: ResolvedParentProxy | undefined
 let mitmCA: MitmCA | undefined
+// Per-session proxy auth token. Generated at proxy start, exported only into
+// the sandbox child env, checked on every CONNECT/request — so a host process
+// dialing 127.0.0.1:<proxyPort> can't reach the filter callback.
+let proxyAuthToken: string | undefined
 const sandboxViolationStore = new SandboxViolationStore()
 
 // ============================================================================
@@ -94,6 +99,9 @@ function registerCleanup(): void {
 
 function matchesDomainPattern(hostname: string, pattern: string): boolean {
   const h = hostname.toLowerCase()
+  // Bare '*' is deny-all when it appears in deniedDomains. The schema only
+  // accepts it there (allowedDomains still rejects it as too broad).
+  if (pattern === '*') return true
   // Support wildcard patterns like *.example.com. Never apply wildcard
   // suffix matching to IP literals — an IPv6 zone-ID payload like
   // `::ffff:1.2.3.4%x.allowed.com` would otherwise pass .endsWith() while
@@ -153,8 +161,9 @@ async function filterNetworkRequest(
     }
   }
 
-  // No matching rules - ask user or deny
-  if (!sandboxAskCallback) {
+  // No matching rules - ask user or deny. strictAllowlist makes the
+  // allowlist deterministic enforcement: never fall through to the callback.
+  if (!sandboxAskCallback || config.network.strictAllowlist) {
     logForDebugging(`No matching config rule, denying: ${host}:${port}`)
     return false
   }
@@ -271,6 +280,7 @@ async function startHttpProxyServer(
     mitmCA,
     filterRequest: config?.network.filterRequest,
     parentProxy,
+    proxyAuthToken,
   })
 
   const server = httpProxyServer
@@ -298,6 +308,7 @@ async function startSocksProxyServer(
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
     parentProxy,
+    proxyAuthToken,
   })
 
   const wrapper = socksProxyServer
@@ -399,7 +410,13 @@ async function initialize(
           ? (config.windows?.proxyPortRange ?? DEFAULT_WINDOWS_PROXY_PORT_RANGE)
           : undefined
 
-      // Conditionally start proxy servers based on config
+      // The auth token is only set when this process owns the proxy; an
+      // external proxy (config.network.httpProxyPort) handles its own auth,
+      // and embedding our token in its URL would be wrong.
+      proxyAuthToken =
+        config.network.httpProxyPort !== undefined
+          ? undefined
+          : randomBytes(16).toString('hex')
       let httpProxyPort: number
       if (config.network.httpProxyPort !== undefined) {
         // Use external HTTP proxy (don't start a server)
@@ -678,6 +695,10 @@ function getSeccompConfig(): SeccompConfig | undefined {
   return config?.seccomp
 }
 
+function getProxyAuthToken(): string | undefined {
+  return proxyAuthToken
+}
+
 function getProxyPort(): number | undefined {
   return managerContext?.httpProxyPort
 }
@@ -818,6 +839,7 @@ async function wrapWithSandbox(
         // Only pass proxy ports if proxy is running (when there are domains to filter)
         httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
         socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
+        proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
         caCertPath: mitmCA?.certPath,
         readConfig,
         writeConfig,
@@ -850,6 +872,7 @@ async function wrapWithSandbox(
         socksProxyPort: needsNetworkProxy
           ? managerContext?.socksProxyPort
           : undefined,
+        proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
         caCertPath: mitmCA?.certPath,
         readConfig,
         writeConfig,
@@ -1174,6 +1197,7 @@ async function reset(): Promise<void> {
 
   // Clear references
   httpProxyServer = undefined
+  proxyAuthToken = undefined
   socksProxyServer = undefined
   managerContext = undefined
   initializationPromise = undefined
@@ -1272,6 +1296,7 @@ export interface ISandboxManager {
   getIgnoreViolations(): Record<string, string[]> | undefined
   getEnableWeakerNestedSandbox(): boolean | undefined
   getProxyPort(): number | undefined
+  getProxyAuthToken(): string | undefined
   getSocksProxyPort(): number | undefined
   getLinuxHttpSocketPath(): string | undefined
   getLinuxSocksSocketPath(): string | undefined
@@ -1320,6 +1345,7 @@ export const SandboxManager: ISandboxManager = {
   getIgnoreViolations,
   getEnableWeakerNestedSandbox,
   getProxyPort,
+  getProxyAuthToken,
   getSocksProxyPort,
   getLinuxHttpSocketPath,
   getLinuxSocksSocketPath,
