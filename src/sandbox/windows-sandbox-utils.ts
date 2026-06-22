@@ -80,11 +80,14 @@ export interface WindowsSandboxParams {
    *
    *   • a path whose basename is `bash` / `bash.exe` → the **actual
    *     path to exec**. Git Bash has no fixed install location, so the
-   *     caller passes the resolved path. The path is taken as-is —
-   *     callers reach here via
-   *     `SandboxManager` only, and the inner shell runs INSIDE the
-   *     restricted-token sandbox regardless, so an unexpected path is
-   *     not a sandbox-escape vector.
+   *     caller passes the resolved path. The path is taken as-is and
+   *     MUST originate from trusted host configuration (user settings
+   *     / install detection), NEVER from workspace or repository
+   *     content. Callers reach here via `SandboxManager` only, and the
+   *     inner shell runs INSIDE the restricted-token sandbox
+   *     regardless, so an unexpected path is not a sandbox-escape
+   *     vector — but it would still be an arbitrary-exec footgun if
+   *     sourced from untrusted input.
    *
    * The child's post-`/c` (or post-`-c`) content is **passthrough** —
    * `&` chains, `"…"`/`'…'` quotes exactly as written. The security
