@@ -1084,10 +1084,11 @@ async function generateFilesystemArgs(
   // but the source is the sentinel-content fake instead of /dev/null.
   // realPath was already normalized (tilde-expanded, realpath'd) by the
   // caller; resolveSymlinkDenyDest covers the symlinked-credential case
-  // for the same reason as above. The fake file lives under os.tmpdir(),
-  // which is reachable read-only via the initial `--ro-bind / /` — no
-  // extra read-allow needed. Adding the dest to maskedFiles ensures a
-  // later denyWrite ro-bind over the same path doesn't undo the mask.
+  // for the same reason as above. The fake's parent dir is explicitly
+  // ro-bound at the end of this function, so the bind source is never
+  // writable from inside the sandbox. Adding the dest to maskedFiles
+  // ensures a later denyWrite ro-bind over the same path doesn't undo
+  // the mask.
   for (const { realPath, fakePath } of maskedFileBinds ?? []) {
     const dest = resolveSymlinkDenyDest(realPath)
     args.push('--ro-bind', fakePath, dest)
