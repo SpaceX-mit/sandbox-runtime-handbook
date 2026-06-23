@@ -46,14 +46,13 @@ export interface MaskedFileBind {
 /**
  * Manager-owned temp dir holding the fake files.
  *
- * INVARIANT: this directory must live OUTSIDE every sandbox write path. The
- * sandbox is `--ro-bind / /` with writable binds layered on top
- * (getDefaultWritePaths() + the caller's allowWrite). os.tmpdir() is fine —
- * the default writable temp is `/tmp/claude`, not `/tmp` itself, and the
- * caller would have to explicitly allowWrite os.tmpdir() to break this. If
- * the sandbox could write the fake file, it could replace the sentinel and
- * the bind would no longer guarantee the real content stays hidden (the
- * bind itself stays read-only, but the source file is what's exposed).
+ * INVARIANT: this directory must never be writable from inside the sandbox.
+ * The Linux layer enforces this by emitting `--ro-bind <dirPath> <dirPath>`
+ * after every other filesystem mount (see generateFilesystemArgs), so the
+ * store stays read-only even if a caller's allowWrite covers os.tmpdir() or
+ * the host's $TMPDIR points under a default-writable path. If the sandbox
+ * could write here it could replace a fake's content (the bind exposes the
+ * source file) or plant a symlink for a later host-side write() to follow.
  */
 export class MaskedFileStore {
   private dir: string | undefined

@@ -598,6 +598,7 @@ function getCredentialRestrictions(
       unsetEnvVars: [],
       setEnvVars: {},
       maskedFileBinds: [],
+      maskedFileStoreDir: undefined,
     }
   }
 
@@ -638,6 +639,7 @@ function getCredentialRestrictions(
     unsetEnvVars: [...new Set(unsetEnvVars)],
     setEnvVars,
     maskedFileBinds,
+    maskedFileStoreDir: maskedFileStore.dirPath,
   }
 }
 
@@ -998,6 +1000,7 @@ async function wrapWithSandbox(
         unsetEnvVars: credentialRestrictions.unsetEnvVars,
         setEnvVars: credentialRestrictions.setEnvVars,
         maskedFileBinds: credentialRestrictions.maskedFileBinds,
+        maskedFileStoreDir: credentialRestrictions.maskedFileStoreDir,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
