@@ -104,6 +104,38 @@ describe('tls-terminate-proxy: end-to-end through createHttpProxyServer', () => 
     expect(JSON.parse(r.body).path).toBe('/ping')
   })
 
+  test('absolute-form request-target is normalized (filterRequest + upstream)', async () => {
+    // RFC 7230 §5.3.2 absolute-form. Some clients send this inside CONNECT
+    // tunnels; without normalization the host concat produced a malformed
+    // hostname like `example.comhttps`.
+    const seen: string[] = []
+    const p = createHttpProxyServer({
+      filter: () => true,
+      filterRequest: async r => {
+        seen.push(r.url)
+        return { action: 'allow' }
+      },
+      mitmCA: ca,
+      tlsTerminateUpstreamCA: CA_PEM,
+    })
+    await new Promise<void>(r => p.listen(0, '127.0.0.1', () => r()))
+    const port = (p.address() as AddressInfo).port
+    try {
+      const r = await curlViaProxy(
+        port,
+        `https://127.0.0.1:${upstreamPort}/abs?x=1`,
+        { requestTarget: `https://127.0.0.1:${upstreamPort}/abs?x=1` },
+      )
+      expect(r.exit).toBe(0)
+      expect(r.status).toBe(200)
+      expect(JSON.parse(r.body).path).toBe('/abs?x=1')
+      expect(seen).toEqual([`https://127.0.0.1:${upstreamPort}/abs?x=1`])
+      expect(new URL(seen[0]!).hostname).toBe('127.0.0.1')
+    } finally {
+      await new Promise<void>(r => p.close(() => r()))
+    }
+  })
+
   test('upstream connect failure → 502 from the terminating proxy', async () => {
     // Proves we are NOT an opaque tunnel: a tunnel would surface a TLS/TCP
     // error to the client (curl exit 35/56); the terminating proxy speaks
@@ -217,7 +249,12 @@ type CurlResult = {
 async function curlViaProxy(
   proxyPort: number,
   url: string,
-  opts: { method?: string; body?: string; cacert?: string } = {},
+  opts: {
+    method?: string
+    body?: string
+    cacert?: string
+    requestTarget?: string
+  } = {},
 ): Promise<CurlResult> {
   const args = [
     '-sS',
@@ -234,6 +271,7 @@ async function curlViaProxy(
     opts.method ?? 'GET',
   ]
   if (opts.body !== undefined) args.push('--data-binary', opts.body)
+  if (opts.requestTarget) args.push('--request-target', opts.requestTarget)
   args.push(url)
 
   // Async spawn so the in-process proxy/upstream can service the request.
