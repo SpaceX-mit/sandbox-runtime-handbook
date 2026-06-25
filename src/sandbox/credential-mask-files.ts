@@ -37,17 +37,6 @@ import type { SentinelRegistry } from './credential-sentinel.js'
 const FILE_KEY_PREFIX = 'file:'
 
 /**
- * Placeholder marker for the i-th distinct extracted credential. NUL bytes
- * are illegal in every text format we expect to mask (.netrc, YAML, JSON,
- * INI) and never occur in credential values, so a marker can never collide
- * with real content nor with another capture that happens to contain a
- * marker-like substring.
- */
-export function extractPlaceholder(i: number): string {
-  return `\0SRT_EXTRACT_${i}\0`
-}
-
-/**
  * Result of {@link extractAndSubstitute}: the file content with each
  * matched capture-group-1 span replaced by `sentinelFor(capture, i)`,
  * plus the distinct captured values in first-seen (index) order.

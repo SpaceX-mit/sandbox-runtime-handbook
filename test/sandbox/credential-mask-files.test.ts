@@ -22,7 +22,6 @@ import {
   MaskedFileStore,
   buildMaskedFileBinds,
   extractAndSubstitute,
-  extractPlaceholder,
   MASKED_FILE_STORE_PREFIX,
 } from '../../src/sandbox/credential-mask-files.js'
 import {
@@ -117,82 +116,92 @@ describe('MaskedFileStore', () => {
 })
 
 describe('extractAndSubstitute', () => {
-  test('single match: capture replaced by placeholder, rest preserved', () => {
+  // Deterministic sentinel callback for unit tests: <S0>, <S1>, …
+  const S = (_: string, i: number) => `<S${i}>`
+
+  test('single match: capture replaced by sentinel, rest preserved', () => {
     const content = 'github.com:\n  oauth_token: ghp_real\n  user: alice\n'
-    const out = extractAndSubstitute(content, 'oauth_token:\\s*(\\S+)')
+    const out = extractAndSubstitute(content, 'oauth_token:\\s*(\\S+)', S)
     expect(out).not.toBeNull()
     expect(out!.captures).toEqual(['ghp_real'])
     expect(out!.fakeContent).toBe(
-      `github.com:\n  oauth_token: ${extractPlaceholder(0)}\n  user: alice\n`,
+      'github.com:\n  oauth_token: <S0>\n  user: alice\n',
     )
     expect(out!.fakeContent).not.toContain('ghp_real')
   })
 
-  test('multiple distinct matches each get their own placeholder', () => {
+  test('multiple distinct matches each get their own sentinel index', () => {
     const content =
       'machine a.example.com password tok-A\n' +
       'machine b.example.com password tok-B\n'
-    const out = extractAndSubstitute(content, 'password\\s+(\\S+)')!
+    const out = extractAndSubstitute(content, 'password\\s+(\\S+)', S)!
     expect(out.captures).toEqual(['tok-A', 'tok-B'])
     expect(out.fakeContent).toBe(
-      `machine a.example.com password ${extractPlaceholder(0)}\n` +
-        `machine b.example.com password ${extractPlaceholder(1)}\n`,
+      'machine a.example.com password <S0>\n' +
+        'machine b.example.com password <S1>\n',
     )
   })
 
-  test('duplicate captures dedupe to one placeholder index', () => {
+  test('duplicate captures dedupe to one sentinel index', () => {
     const content = 'password tok-X\npassword tok-X\npassword tok-Y\n'
-    const out = extractAndSubstitute(content, 'password (\\S+)')!
+    const out = extractAndSubstitute(content, 'password (\\S+)', S)!
     expect(out.captures).toEqual(['tok-X', 'tok-Y'])
     expect(out.fakeContent).toBe(
-      `password ${extractPlaceholder(0)}\n` +
-        `password ${extractPlaceholder(0)}\n` +
-        `password ${extractPlaceholder(1)}\n`,
+      'password <S0>\npassword <S0>\npassword <S1>\n',
     )
   })
 
   test('returns null when the pattern matches nothing', () => {
-    expect(extractAndSubstitute('no creds here', 'password (\\S+)')).toBeNull()
+    expect(
+      extractAndSubstitute('no creds here', 'password (\\S+)', S),
+    ).toBeNull()
   })
 
   test('throws when a match leaves group 1 undefined', () => {
     // Optional group that does not participate — accepting this would
     // mask nothing for that occurrence, so the helper refuses.
-    expect(() => extractAndSubstitute('token: \n', 'token: (\\S+)?')).toThrow(
-      /capture group 1/,
-    )
+    expect(() =>
+      extractAndSubstitute('token: \n', 'token: (\\S+)?', S),
+    ).toThrow(/capture group 1/)
   })
 
   test('a capture that is a substring of another does not corrupt the longer one', () => {
-    // tok is a prefix of tok-long; longest-first replacement keeps the
-    // longer capture intact.
+    // tok is a prefix of tok-long; offset-based replacement touches only
+    // each match's own group-1 span, so neither capture corrupts the other.
     const content = 'a=tok-long b=tok'
-    const out = extractAndSubstitute(content, '[ab]=(\\S+)')!
+    const out = extractAndSubstitute(content, '[ab]=(\\S+)', S)!
     expect(out.captures).toEqual(['tok-long', 'tok'])
-    expect(out.fakeContent).toBe(
-      `a=${extractPlaceholder(0)} b=${extractPlaceholder(1)}`,
-    )
+    expect(out.fakeContent).toBe('a=<S0> b=<S1>')
   })
 
   test('overlapping pattern matches are handled by the regex engine, not us', () => {
     // matchAll with /g does not return overlapping matches, so the
     // helper sees only the engine's non-overlapping set. This test pins
     // that assumption: 'aaa' against /(aa)/g matches once at index 0.
-    const out = extractAndSubstitute('aaa', '(aa)')!
+    const out = extractAndSubstitute('aaa', '(aa)', S)!
     expect(out.captures).toEqual(['aa'])
+    expect(out.fakeContent).toBe('<S0>a')
   })
 
-  test('empty captures are skipped, not turned into placeholders', () => {
-    // (\S*) can capture the empty string at end-of-line; replacing the
-    // empty string would interleave a placeholder between every char.
-    const out = extractAndSubstitute('k=v\nk=\n', 'k=(\\S*)')!
+  test('empty captures are skipped, not turned into sentinels', () => {
+    // (\S*) can capture the empty string at end-of-line; a zero-width
+    // span has nothing to mask, so the helper leaves it as-is.
+    const out = extractAndSubstitute('k=v\nk=\n', 'k=(\\S*)', S)!
     expect(out.captures).toEqual(['v'])
-    expect(out.fakeContent).toBe(`k=${extractPlaceholder(0)}\nk=\n`)
+    expect(out.fakeContent).toBe('k=<S0>\nk=\n')
   })
 
-  test('placeholders contain NUL so they cannot collide with text content', () => {
-    expect(extractPlaceholder(0)).toContain('\0')
-    expect(extractPlaceholder(7)).toBe('\0SRT_EXTRACT_7\0')
+  test('callback receives the captured value and its dedupe index', () => {
+    const calls: Array<[string, number]> = []
+    extractAndSubstitute('k=A k=B k=A', 'k=(\\S+)', (cap, i) => {
+      calls.push([cap, i])
+      return '_'
+    })
+    expect(calls).toEqual([
+      ['A', 0],
+      ['B', 1],
+      ['A', 0],
+    ])
   })
 })
 
