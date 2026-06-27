@@ -41,9 +41,8 @@ use windows::Win32::Security::Cryptography::{
     BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
 };
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW,
-    RegQueryValueExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
-    KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE,
+    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, HKEY,
+    HKEY_LOCAL_MACHINE, KEY_READ, KEY_SET_VALUE, REG_DWORD,
 };
 use windows::Win32::UI::Shell::DeleteProfileW;
 
@@ -339,45 +338,18 @@ fn ensure_user(name: &str, password: &str) -> Result<()> {
 /// picker. Cosmetic only — the account is still fully usable via
 /// `CreateProcessWithLogonW`.
 fn set_logon_ui_hidden(user: &str, hide: bool) -> Result<()> {
-    let sub_w = wstr(WINLOGON_USERLIST);
-    let val_w = wstr(user);
-    let mut hkey = HKEY::default();
     if hide {
-        let r = unsafe {
-            RegCreateKeyExW(
-                HKEY_LOCAL_MACHINE,
-                pcwstr(&sub_w),
-                None,
-                PCWSTR::null(),
-                REG_OPTION_NON_VOLATILE,
-                KEY_SET_VALUE,
-                None,
-                &mut hkey,
-                None,
-            )
-        };
-        if r.is_err() {
-            return Err(anyhow!(
-                "RegCreateKeyExW({WINLOGON_USERLIST}): {r:?}"
-            ));
-        }
-        let zero: u32 = 0;
-        let r = unsafe {
-            RegSetValueExW(
-                hkey,
-                pcwstr(&val_w),
-                None,
-                REG_DWORD,
-                Some(&zero.to_ne_bytes()),
-            )
-        };
-        unsafe {
-            let _ = RegCloseKey(hkey);
-        }
-        if r.is_err() {
-            return Err(anyhow!("RegSetValueExW({user}=0): {r:?}"));
-        }
+        crate::util::reg_set_value(
+            HKEY_LOCAL_MACHINE,
+            WINLOGON_USERLIST,
+            user,
+            REG_DWORD,
+            &0u32.to_ne_bytes(),
+        )?;
     } else {
+        let sub_w = wstr(WINLOGON_USERLIST);
+        let val_w = wstr(user);
+        let mut hkey = HKEY::default();
         // Open (not create) — if the key was never made there's
         // nothing to delete.
         let r = unsafe {

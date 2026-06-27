@@ -72,6 +72,53 @@ pub fn local_free(p: *mut c_void) {
 }
 
 use anyhow::{anyhow, Result};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, KEY_SET_VALUE,
+    REG_OPTION_NON_VOLATILE, REG_VALUE_TYPE,
+};
+
+/// `RegCreateKeyExW(root, subkey, KEY_SET_VALUE)` →
+/// `RegSetValueExW(value_name, ty, data)` → `RegCloseKey`. Creates
+/// intermediate subkeys. The single registry-write helper for
+/// `cert_store::install_root_ca` (`HKEY_USERS`, `REG_BINARY`) and
+/// `user::set_logon_ui_hidden` (`HKEY_LOCAL_MACHINE`, `REG_DWORD`).
+pub fn reg_set_value(
+    root: HKEY,
+    subkey: &str,
+    value_name: &str,
+    ty: REG_VALUE_TYPE,
+    data: &[u8],
+) -> Result<()> {
+    let sub_w = wstr(subkey);
+    let val_w = wstr(value_name);
+    let mut hkey = HKEY::default();
+    let r = unsafe {
+        RegCreateKeyExW(
+            root,
+            pcwstr(&sub_w),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut hkey,
+            None,
+        )
+    };
+    if r.is_err() {
+        return Err(anyhow!("RegCreateKeyExW({subkey}): {r:?}"));
+    }
+    let r =
+        unsafe { RegSetValueExW(hkey, pcwstr(&val_w), None, ty, Some(data)) };
+    unsafe {
+        let _ = RegCloseKey(hkey);
+    }
+    if r.is_err() {
+        return Err(anyhow!("RegSetValueExW({subkey}\\{value_name}): {r:?}"));
+    }
+    Ok(())
+}
+
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows::Win32::Security::{
     GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR,

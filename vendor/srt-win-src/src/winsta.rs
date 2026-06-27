@@ -1,44 +1,54 @@
-//! Non-interactive window station + desktop for the sandbox child.
+//! Non-interactive desktop for the sandbox child.
 //!
-//! Creates a per-broker anonymous window station with a single
-//! desktop attached, and exposes the `<wsname>\desk` path that
+//! Creates a per-exec named desktop on the **caller's current window
+//! station** and exposes the `<winsta>\<desk>` path that
 //! `STARTUPINFOW.lpDesktop` consumes. The sandbox child spawns onto
-//! this WS+desktop and so cannot enumerate or message top-level
-//! windows on the user's interactive `WinSta0`.
+//! this desktop and so cannot enumerate or message top-level windows
+//! on the interactive `WinSta0\Default`.
 //!
-//! The kernel reference-counts a window station by attached
-//! processes. The broker keeps both handles open from creation
-//! until after the child exits — dropping `WinStaDesk` then
-//! releases the kernel objects.
+//! Desktop-only — no `CreateWindowStationW`. Creating a new window
+//! station requires create rights on the session's
+//! `\Windows\WindowStations` object directory, which a non-elevated
+//! token does not have on a standard interactive session
+//! (`CreateWindowStationW → ACCESS_DENIED`, verified by probe).
+//! `CreateDesktopW` on the **current** station works non-elevated, and
+//! a separate desktop already provides the isolation that matters: a
+//! window's message queue is per-desktop, so processes on different
+//! desktops cannot `SendMessage`/enumerate each other (the shatter
+//! threat). The clipboard- and atom-table separation a separate
+//! station would add is already covered by the Job's UI limits
+//! (`JOB_OBJECT_UILIMIT_READCLIPBOARD | WRITECLIPBOARD | GLOBALATOMS`).
 //!
-//! We do NOT permanently re-home the broker via
-//! `SetProcessWindowStation`; we briefly attach to the new WS to
-//! create the desktop on it, then restore.
+//! The kernel reference-counts a desktop by attached threads/handles.
+//! The caller keeps the [`IsolatedDesk`] handle open from creation
+//! until after the child exits — dropping it then releases the
+//! kernel object.
 
 use anyhow::{anyhow, Context, Result};
 use std::ffi::c_void;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::StationsAndDesktops::{
-    CloseDesktop, CloseWindowStation, CreateDesktopW, CreateWindowStationW,
-    GetProcessWindowStation, GetUserObjectInformationW,
-    SetProcessWindowStation, DESKTOP_CONTROL_FLAGS, HDESK, HWINSTA, UOI_NAME,
+    CloseDesktop, CreateDesktopW, GetProcessWindowStation, GetThreadDesktop,
+    GetUserObjectInformationW, DESKTOP_CONTROL_FLAGS, HDESK, UOI_NAME,
+};
+use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::Security::Cryptography::{
+    BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
 };
 
 use crate::util::wstr;
 
-// winuser.h: WINSTA_ALL_ACCESS = 0x37F; DESKTOP_ALL_ACCESS = 0x1FF.
-// OR with STANDARD_RIGHTS_REQUIRED so the broker holds full control
-// on the objects it just created.
+// winuser.h: DESKTOP_ALL_ACCESS = 0x1FF. OR with
+// STANDARD_RIGHTS_REQUIRED so the creator holds full control on the
+// object it just made.
 const STANDARD_RIGHTS_REQUIRED: u32 = 0x000F_0000;
-const WS_ALL_ACCESS: u32 = STANDARD_RIGHTS_REQUIRED | 0x0000_037F;
 const DESK_ALL_ACCESS: u32 = STANDARD_RIGHTS_REQUIRED | 0x0000_01FF;
 
-/// RAII holder for the sandbox window station + its desktop, plus
-/// the wide `<wsname>\desk` buffer that backs
+/// RAII holder for a per-exec desktop on the caller's current window
+/// station, plus the wide `<winsta>\<desk>` buffer that backs
 /// `STARTUPINFOW.lpDesktop`.
-pub struct WinStaDesk {
-    winsta: HWINSTA,
+pub struct IsolatedDesk {
     desktop: HDESK,
     /// `STARTUPINFOW.lpDesktop` is `PWSTR` (mutable wide pointer per
     /// the API contract), so we keep the buffer here and hand out a
@@ -46,109 +56,66 @@ pub struct WinStaDesk {
     desk_path: Vec<u16>,
 }
 
-impl WinStaDesk {
-    /// Create an anonymous WS with a single `desk` desktop.
+impl IsolatedDesk {
+    /// Create a fresh per-exec desktop on the **current** window
+    /// station — no `SetProcessWindowStation` dance. Default DACL
+    /// (creator owns it; the only caller is `run_lockdown`, where the
+    /// child shares the caller's user SID).
     ///
-    /// A NULL name lets the kernel mint a unique anonymous name —
-    /// passing an explicit name into the WS namespace
-    /// (`\Sessions\<n>\Windows\WindowStations`) requires admin on
-    /// Vista+, which a non-elevated broker doesn't have. The
-    /// kernel-generated name is recovered via
-    /// `GetUserObjectInformationW(UOI_NAME)`.
+    /// Name = `srt-sb-<pid>-<rand32>` (random suffix so concurrent
+    /// execs in the same process — e.g. tests — don't collide; the
+    /// kernel-assigned name is read back for the `lpDesktop` path).
     pub fn new() -> Result<Self> {
-        // 1) Anonymous WS, default DACL.
-        let winsta = unsafe {
-            CreateWindowStationW(PCWSTR::null(), 0, WS_ALL_ACCESS, None)
-                .context("CreateWindowStationW(NULL)")?
-        };
-        let ws_name = match object_name(HANDLE(winsta.0)) {
-            Ok(n) => n,
-            Err(e) => {
-                unsafe {
-                    let _ = CloseWindowStation(winsta);
-                }
-                return Err(e.context("UOI_NAME on new window station"));
-            }
-        };
+        // Current station name (for the `<winsta>\<desk>` path). The
+        // child's `lpDesktop` carries this name verbatim, so if the
+        // read failed a guessed `WinSta0` would point the child at a
+        // station the runner may not even be on — propagate.
+        let ws_name = current_winsta_name()
+            .context("read caller's window-station name")?;
 
-        // 2) Attach to it just long enough to create the desktop.
-        //    `CreateDesktopW` targets the *calling process's* current
-        //    WS; we must point at the new one, create, then restore
-        //    — even on the error path so the broker isn't left
-        //    re-homed.
-        let prev = match unsafe { GetProcessWindowStation() } {
-            Ok(p) => p,
-            Err(e) => {
-                unsafe {
-                    let _ = CloseWindowStation(winsta);
-                }
-                return Err(anyhow!(
-                    "GetProcessWindowStation (snapshot): {e}"
-                ));
-            }
-        };
-        if let Err(e) = unsafe { SetProcessWindowStation(winsta) } {
-            unsafe {
-                let _ = CloseWindowStation(winsta);
-            }
-            return Err(anyhow!(
-                "SetProcessWindowStation({ws_name}): {e}"
-            ));
+        // pid + 32 random bits (system CSPRNG). The random suffix
+        // is what makes concurrent same-process callers (e.g. test
+        // threads) collision-free, so don't quietly fall back to a
+        // zero suffix on RNG failure — surface it. `BCryptGenRandom`
+        // with `USE_SYSTEM_PREFERRED_RNG` essentially never fails.
+        let mut r = [0u8; 4];
+        unsafe {
+            BCryptGenRandom(None, &mut r, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
         }
+        .ok()
+        .context("BCryptGenRandom (desktop name suffix)")?;
+        let req = format!(
+            "srt-sb-{}-{:08x}",
+            std::process::id(),
+            u32::from_le_bytes(r),
+        );
+        let req_w = wstr(&req);
 
-        let desk_name_w = wstr("desk");
-        let desktop_result = unsafe {
+        let desktop = unsafe {
             CreateDesktopW(
-                PCWSTR(desk_name_w.as_ptr()),
+                PCWSTR(req_w.as_ptr()),
                 PCWSTR::null(),
                 None,
                 DESKTOP_CONTROL_FLAGS(0),
                 DESK_ALL_ACCESS,
                 None,
             )
-        };
+        }
+        .with_context(|| format!("CreateDesktopW({req}) on {ws_name}"))?;
 
-        // Always restore the broker's WS — a broker stuck on the
-        // sandbox WS is a fatal state. If both CreateDesktopW and
-        // restore failed, report both.
-        let restore = unsafe { SetProcessWindowStation(prev) };
-
-        let desktop = match (desktop_result, &restore) {
-            (Ok(d), Ok(())) => d,
-            (Ok(d), Err(re)) => {
-                // Desktop created but we can't restore the broker.
-                // Close what we made; the restore failure is the
-                // error that matters.
+        // Read back the actual assigned name.
+        let desk_name = match object_name(HANDLE(desktop.0)) {
+            Ok(n) => n,
+            Err(e) => {
                 unsafe {
-                    let _ = CloseDesktop(d);
-                    let _ = CloseWindowStation(winsta);
+                    let _ = CloseDesktop(desktop);
                 }
-                return Err(anyhow!(
-                    "SetProcessWindowStation(restore previous): {re} \
-                     (after successful CreateDesktopW on {ws_name})"
-                ));
-            }
-            (Err(de), restore_r) => {
-                unsafe {
-                    let _ = CloseWindowStation(winsta);
-                }
-                return Err(match restore_r {
-                    Ok(()) => anyhow!(
-                        "CreateDesktopW(desk) on {ws_name}: {de}"
-                    ),
-                    Err(re) => anyhow!(
-                        "CreateDesktopW(desk) on {ws_name}: {de}; AND \
-                         SetProcessWindowStation(restore) also \
-                         failed: {re}"
-                    ),
-                });
+                return Err(e.context("UOI_NAME on new desktop"));
             }
         };
 
-        // `<wsname>\desk` — backslash separator.
-        let desk_path = wstr(&format!("{ws_name}\\desk"));
-
-        Ok(Self { winsta, desktop, desk_path })
+        let desk_path = wstr(&format!("{ws_name}\\{desk_name}"));
+        Ok(Self { desktop, desk_path })
     }
 
     /// Pointer to the wide name buffer for `STARTUPINFOW.lpDesktop`.
@@ -159,14 +126,51 @@ impl WinStaDesk {
     }
 }
 
-impl Drop for WinStaDesk {
+impl Drop for IsolatedDesk {
     fn drop(&mut self) {
         unsafe {
-            // Desktop first (it references the WS), then WS.
             let _ = CloseDesktop(self.desktop);
-            let _ = CloseWindowStation(self.winsta);
         }
     }
+}
+
+/// Name of the window station this process is attached to (e.g.
+/// `WinSta0`, `Service-0x0-<logonid>$`).
+pub fn current_winsta_name() -> Result<String> {
+    let ws = unsafe { GetProcessWindowStation() }
+        .context("GetProcessWindowStation")?;
+    if ws.0.is_null() {
+        return Err(anyhow!("GetProcessWindowStation returned null"));
+    }
+    object_name(HANDLE(ws.0))
+}
+
+/// Name of this thread's current desktop (e.g. `Default`,
+/// `srt-sb-…`). `None` on failure.
+pub fn current_desktop_name() -> Option<String> {
+    let d = unsafe { GetThreadDesktop(GetCurrentThreadId()) }.ok()?;
+    if d.0.is_null() {
+        return None;
+    }
+    object_name(HANDLE(d.0)).ok()
+}
+
+/// `true` when this thread is on the interactive `Default` desktop.
+///
+/// `run_lockdown` only creates a fresh [`IsolatedDesk`] when this
+/// returns `true` — both the same-user broker and the two-hop runner
+/// land on `WinSta0\Default` (the runner via `CreateProcessWithLogonW`
+/// with `lpDesktop = NULL`, where seclogon grants the new logon
+/// access to `WinSta0` including `WINSTA_CREATEDESKTOP`), so in
+/// practice this is always `true` and each creates its own
+/// `WinSta0\srt-sb-…` for its child. The check is the safety: a
+/// caller already off `Default` (services, nested) inherits instead.
+/// Name-based — a non-`Default` custom desktop is assumed isolated.
+/// Any read failure → `true` (the safe default — try to create).
+pub fn on_default_desktop() -> bool {
+    current_desktop_name()
+        .map(|n| n.eq_ignore_ascii_case("Default"))
+        .unwrap_or(true)
 }
 
 /// Read a user-object's `UOI_NAME` (returned as a wide
