@@ -188,6 +188,30 @@ enum Cmd {
         /// Per-exec write-deny — see `--deny-read`.
         #[arg(long = "deny-write")]
         deny_write: Vec<String>,
+        /// Run the child as the dedicated `srt-sandbox` user via
+        /// the two-hop launch: this process (the broker, real user)
+        /// applies the per-exec stamps and self-protects, then
+        /// `CreateProcessWithLogonW`s `srt-win runner` under
+        /// `srt-sandbox`, which does the existing
+        /// token/job/desktop/mitigation lockdown and spawns the
+        /// child. Requires `srt-win install` to have provisioned
+        /// the user (exit **15** otherwise). Opt-in — without this
+        /// flag the same-user deny-only-group path is unchanged.
+        #[arg(long)]
+        as_sandbox_user: bool,
+        /// `KEY=VALUE` pair overlaid on the sandbox-user runner's
+        /// profile environment when building the child's env block
+        /// (with `--as-sandbox-user`). Repeatable. The broker
+        /// forwards exactly these — it does NOT enumerate its own
+        /// environment for proxy/CA vars; the caller (whose
+        /// `generateProxyEnvVars` is the single source) passes them
+        /// here explicitly.
+        #[arg(
+            long = "env",
+            value_name = "KEY=VALUE",
+            requires = "as_sandbox_user",
+        )]
+        env: Vec<String>,
         /// Target executable followed by its arguments. Use `--`
         /// to terminate srt-win's own option parsing.
         #[arg(
@@ -198,6 +222,13 @@ enum Cmd {
         )]
         target: Vec<String>,
     },
+    /// Inside-the-logon half of `exec --as-sandbox-user`. Reads a
+    /// length-prefixed `RunnerCmd` from stdin and dispatches as the
+    /// current user — which, when launched by the broker via
+    /// `CreateProcessWithLogonW`, is `srt-sandbox`. Not intended to
+    /// be invoked directly.
+    #[command(hide = true)]
+    Runner,
 }
 
 /// Group resolution: either by name (looked up via
@@ -221,7 +252,8 @@ enum UserCmd {
     /// Print the sandbox user's provisioning state as JSON:
     /// `{user: {exists, sid?, group_exists, group_sid?,
     /// in_builtin_users, in_sandbox_group, hidden_from_logon},
-    /// cred_present, marker_version?, marker_user_sid?}`.
+    /// cred_present, marker_version?, marker_user_sid?,
+    /// ca_cert_thumb?, ca_cert_pem?}`.
     Status,
     /// Print the sandbox user's decrypted password (and only the
     /// password) to stdout. The broker uses this for
@@ -230,6 +262,17 @@ enum UserCmd {
     /// DENY for `sandbox-runtime-users`, and machine-scope DPAPI
     /// is **not** a confidentiality boundary without that DENY.
     ReadCred,
+    /// Install (or replace) the MITM CA in the **sandbox user's**
+    /// `CurrentUser\Root` and record it in the state DB. The cert
+    /// has a separate lifecycle from `srt-win install` — install
+    /// provisions the account/filters and never touches the CA;
+    /// this is the only command that sets it. Does NOT require
+    /// elevation. Persistent until `srt-win uninstall`.
+    TrustCa {
+        /// PEM- or DER-encoded CA certificate file.
+        #[arg(value_name = "PATH")]
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -500,13 +543,27 @@ fn canonicalize_deny_targets(
     Ok((targets, bad_inputs))
 }
 
+/// Read `path` and decode it as a single DER-encoded X.509
+/// certificate (PEM, base64, or raw DER input — see
+/// [`srt_win::cert_store::CertDer::from_pem_or_der`]). Used by
+/// `user trust-ca`.
+#[cfg(windows)]
+fn read_ca_der(path: &str) -> anyhow::Result<srt_win::cert_store::CertDer> {
+    use anyhow::Context;
+    srt_win::cert_store::CertDer::from_pem_or_der(
+        &std::fs::read(path)
+            .with_context(|| format!("read CA cert '{path}'"))?,
+    )
+    .with_context(|| format!("decode CA cert '{path}'"))
+}
+
 /// Drop-guarded per-exec restore. Constructed immediately after a
 /// successful per-exec `stamp_targets` so EVERY exit path between
 /// stamp and `process::exit` — `?`, panic, or normal return — runs
 /// `restore_all` for `holder`. The captured-Result IIFE this
 /// replaces only covered `?`; a panic in `open_holder_fences` or
-/// `launch::run` would unwind straight past the restore and leak
-/// the stamp under a now-dead PID. A leaked stamp is fail-closed
+/// `launch::run_lockdown` would unwind straight past the restore
+/// and leak the stamp under a now-dead PID. A leaked stamp is fail-closed
 /// (file stays broker-only) and crash-recovery reaps it once
 /// `holder` is observed dead by the next `with_init_lock`, so
 /// `failed > 0` is logged but never changes the child's exit code.
@@ -873,6 +930,8 @@ fn run() -> anyhow::Result<()> {
             use srt_win::{install, user};
             let st = user::status()?;
             let setup = install::read_setup().ok().flatten();
+            let ca = install::read_ca_cert()?;
+            let ca = ca.as_ref();
             println!(
                 "{}",
                 json!({
@@ -881,14 +940,27 @@ fn run() -> anyhow::Result<()> {
                     "marker_version": setup.as_ref().map(|s| s.marker_version),
                     "marker_user_sid": setup.as_ref()
                         .map(|s| s.sandbox_user_sid.as_str()),
+                    "ca_cert_thumb": ca.map(|c| c.thumb()).transpose()?,
+                    "ca_cert_pem": ca.map(|c| c.to_pem()).transpose()?,
                 })
             );
         }
         Cmd::User { sub: UserCmd::ReadCred } => {
-            let (_, pw) = srt_win::install::read_cred()?;
+            let cred = srt_win::install::read_cred()?;
             // Password only, no trailing whitespace, so a caller
             // can capture stdout verbatim.
-            print!("{pw}");
+            print!("{}", cred.pw);
+        }
+        Cmd::User { sub: UserCmd::TrustCa { path } } => {
+            use srt_win::install;
+            let der = read_ca_der(&path)?;
+            let cred = install::read_cred()?;
+            install::trust_ca(&der, &cred)?;
+            eprintln!(
+                "srt-win: CA installed into sandbox-user Root \
+                 (thumb={})",
+                der.thumb()?,
+            );
         }
 
         // ─── group ─────────────────────────────────────────────────
@@ -1227,6 +1299,12 @@ fn run() -> anyhow::Result<()> {
             }
         }
 
+        // ─── runner ────────────────────────────────────────────────
+        Cmd::Runner => {
+            let code = srt_win::runner::run()?;
+            std::process::exit(code as i32);
+        }
+
         // ─── exec ──────────────────────────────────────────────────
         Cmd::Exec {
             group,
@@ -1236,12 +1314,14 @@ fn run() -> anyhow::Result<()> {
             holder_pid,
             deny_read,
             deny_write,
+            as_sandbox_user,
+            env,
             target,
         } => {
             use srt_win::{acl, launch, state_db};
             let gsid = resolve_group_sid(&group)?;
             // WFP pre-flight (mirrors the group-state pre-flight in
-            // launch::run). The TS host already gates on
+            // launch::run_lockdown). The TS host already gates on
             // `getWindowsWfpStatus().state == 'installed'`, but
             // `srt-win exec` invoked directly would otherwise
             // fail-open with no network fence at all. Done here
@@ -1311,6 +1391,25 @@ fn run() -> anyhow::Result<()> {
                 Some(pid) => Some(open_holder_fences(
                     state_db::HolderPid(pid), "dir",
                 )?),
+            };
+
+            // Credential read happens BEFORE the per-exec stamp so
+            // the exit-15 fast-fail (not provisioned / stale cred)
+            // can `process::exit` without a guard to drop. After
+            // this point every exit routes through `?` (Drop runs)
+            // or the explicit drop chain at the bottom.
+            let sandbox_cred = if as_sandbox_user {
+                match srt_win::install::read_cred() {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        eprintln!(
+                            "srt-win: error: --as-sandbox-user: {e:#}"
+                        );
+                        std::process::exit(15);
+                    }
+                }
+            } else {
+                None
             };
 
             // Per-exec file deny — `--deny-read`/`--deny-write`. The
@@ -1410,13 +1509,67 @@ fn run() -> anyhow::Result<()> {
                 None => None,
             };
 
-            let spec = launch::ExecSpec {
-                group_sid: &gsid,
-                skip_group_check,
-                target_exe: &exe,
-                target_args: args,
+            let code = if let Some(cred) = sandbox_cred {
+                // Two-hop launch.
+                use srt_win::{logon, runner};
+                // Self-protect the BROKER (real user, group enabled)
+                // before the logon. The runner self-protects too;
+                // this covers the broker→child hop. Best-effort.
+                if let Err(e) =
+                    srt_win::self_protect::install_broker_dacl(Some(&gsid))
+                {
+                    eprintln!(
+                        "srt-win: WARNING: install_broker_dacl: {e:#}"
+                    );
+                }
+                // env_overlay = exactly what the caller passed via
+                // `--env`. The broker does not enumerate its own
+                // environment; the caller (whose proxy/CA-var
+                // builder is the single source) supplies the full
+                // overlay explicitly.
+                let env_overlay: Vec<(String, String)> = env
+                    .iter()
+                    .map(|kv| {
+                        kv.split_once('=')
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "--env value '{kv}' has no '=' \
+                                     (expected KEY=VALUE)"
+                                )
+                            })
+                    })
+                    .collect::<anyhow::Result<_>>()?;
+                eprintln!(
+                    "srt-win: --as-sandbox-user: launching runner as \
+                     '{}' (overlay={} var(s))",
+                    cred.user,
+                    env_overlay.len(),
+                );
+                let bytes = runner::encode_cmd(&runner::RunnerCmd::Exec(
+                    runner::RunnerSpec {
+                        argv: target.clone(),
+                        env_overlay,
+                    },
+                ))?;
+                let cwd = std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.to_str().map(String::from));
+                logon::spawn_runner(
+                    &cred.user, &cred.pw, cwd.as_deref(), &bytes,
+                )?
+                // `cred` drops here → `SandboxCred::Drop` zeroes the
+                // password.
+            } else {
+                launch::run_lockdown(
+                    &exe,
+                    args,
+                    &launch::LaunchMode::SameUser {
+                        group_sid: gsid.clone(),
+                        skip_group_check,
+                    },
+                )?
             };
-            let code = launch::run(&spec)?;
 
             // Lift fences first (so restore re-takes the mutex
             // with no handles open on stamped parents), then run

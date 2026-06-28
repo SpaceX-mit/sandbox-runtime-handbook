@@ -145,7 +145,12 @@ CREATE TABLE IF NOT EXISTS sandbox_user (
   group_sid       TEXT    NOT NULL,
   cred            BLOB    NOT NULL,
   marker_version  INTEGER NOT NULL,
-  created_at_unix INTEGER NOT NULL
+  created_at_unix INTEGER NOT NULL,
+  -- DER-encoded MITM CA certificate (`srt-win user trust-ca`).
+  -- NULL when no CA was installed. Persisted so `user status` can
+  -- surface the thumbprint + PEM to the host's tlsTerminate setup
+  -- without it having to re-read the original file.
+  ca_cert         BLOB
 );
 "#;
 
@@ -599,6 +604,24 @@ pub fn open_db_at(path: &std::path::Path) -> Result<Connection> {
         .context("drop incompatible dev schema")?;
     }
     conn.execute_batch(SCHEMA_SQL).context("apply schema")?;
+    // Additive column on `sandbox_user` (table predates it).
+    // `CREATE TABLE IF NOT EXISTS` doesn't add columns, so probe
+    // `pragma_table_info` and ALTER when absent.
+    let has_ca = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('sandbox_user') \
+             WHERE name = 'ca_cert'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has_ca {
+        conn.execute(
+            "ALTER TABLE sandbox_user ADD COLUMN ca_cert BLOB", [],
+        )
+        .context("ALTER sandbox_user.ca_cert")?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(conn)
 }
@@ -606,7 +629,9 @@ pub fn open_db_at(path: &std::path::Path) -> Result<Connection> {
 /// One row of the `sandbox_user` table — the install-time setup
 /// record: the sandbox user's DPAPI-encrypted credential plus the
 /// setup marker. Written by `srt-win install`, read by the
-/// non-elevated broker.
+/// non-elevated broker. The `ca_cert` column is read/written
+/// separately ([`read_ca_cert`] / [`set_ca_cert`]) so this struct
+/// carries exactly what [`write_setup_info`] owns.
 #[derive(Debug, Clone)]
 pub struct SetupInfo {
     pub sandbox_user: String,
@@ -618,16 +643,23 @@ pub struct SetupInfo {
     pub created_at_unix: u64,
 }
 
-/// Write the setup record. Single-row `INSERT OR REPLACE`, so a
-/// crash mid-install never leaves a partial marker. Install is
-/// sequential under self-elevation, so the caller doesn't need
-/// [`with_init_lock`].
+/// Write the setup record. `ON CONFLICT … DO UPDATE` (NOT
+/// `INSERT OR REPLACE`) so a re-install preserves any column this
+/// function doesn't own — currently `ca_cert`, whose only writer
+/// is [`set_ca_cert`]. Install is sequential under self-elevation,
+/// so the caller doesn't need [`with_init_lock`].
 pub fn write_setup_info(conn: &Connection, info: &SetupInfo) -> Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO sandbox_user \
-         (username, user_sid, group_sid, cred, marker_version, \
-          created_at_unix) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO sandbox_user \
+           (username, user_sid, group_sid, cred, marker_version, \
+            created_at_unix) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         ON CONFLICT(username) DO UPDATE SET \
+           user_sid        = excluded.user_sid, \
+           group_sid       = excluded.group_sid, \
+           cred            = excluded.cred, \
+           marker_version  = excluded.marker_version, \
+           created_at_unix = excluded.created_at_unix",
         params![
             info.sandbox_user,
             info.sandbox_user_sid,
@@ -637,7 +669,7 @@ pub fn write_setup_info(conn: &Connection, info: &SetupInfo) -> Result<()> {
             info.created_at_unix as i64,
         ],
     )
-    .context("INSERT sandbox_user")?;
+    .context("UPSERT sandbox_user")?;
     Ok(())
 }
 
@@ -669,6 +701,42 @@ pub fn read_setup_info(conn: &Connection) -> Result<Option<SetupInfo>> {
         Err(e) if missing_sandbox_user_table(&e) => Ok(None),
         Err(e) => Err(anyhow!("SELECT sandbox_user: {e}")),
     }
+}
+
+/// Read just the `ca_cert` column from the (single) row. `Ok(None)`
+/// when no install has run, no CA was recorded, or the table/column
+/// is absent.
+pub fn read_ca_cert(
+    conn: &Connection,
+) -> Result<Option<crate::cert_store::CertDer>> {
+    match conn
+        .query_row("SELECT ca_cert FROM sandbox_user LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .optional()
+    {
+        Ok(v) => Ok(v.flatten()),
+        Err(e) if missing_sandbox_user_table(&e) => Ok(None),
+        Err(e) => Err(anyhow!("SELECT sandbox_user.ca_cert: {e}")),
+    }
+}
+
+/// Overwrite just the `ca_cert` column on the (single) existing
+/// row. `srt-win user trust-ca` uses this to record a CA without
+/// re-provisioning. Fails when no install has run yet.
+pub fn set_ca_cert(
+    conn: &Connection,
+    der: &crate::cert_store::CertDer,
+) -> Result<()> {
+    let n = conn
+        .execute("UPDATE sandbox_user SET ca_cert = ?1", params![der])
+        .context("UPDATE sandbox_user.ca_cert")?;
+    if n == 0 {
+        bail!(
+            "no sandbox-user row to attach CA to — run `srt-win install`"
+        );
+    }
+    Ok(())
 }
 
 /// `DELETE FROM sandbox_user` — uninstall clears the credential

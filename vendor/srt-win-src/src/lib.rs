@@ -27,3 +27,7 @@ pub mod state_db;
 pub mod dpapi;
 pub mod user;
 pub mod install;
+
+pub mod cert_store;
+pub mod logon;
+pub mod runner;

@@ -60,27 +60,36 @@ pub fn open_self_token() -> Result<HANDLE> {
     }
 }
 
-/// Build the deny-only-group restricted token from `base` (the
-/// broker's own token). `group_sid` is the discriminator group that
-/// gets flipped deny-only. Returns a non-primary token; the caller
-/// duplicates to primary via [`to_primary`].
-pub fn make_sandbox_token(base: HANDLE, group_sid: &str) -> Result<HANDLE> {
+/// Build the restricted child token from `base`. When `flip_group`
+/// is `Some(sid)`, that SID is added to `SidsToDisable` alongside
+/// `BUILTIN\Administrators` — the deny-only-group shape. When
+/// `None`, only Administrators is disabled (the separate-sandbox-
+/// user runner path: the sandbox user is not a member of the
+/// discriminator group, so there is nothing to flip). Returns a
+/// non-primary token; the caller duplicates to primary via
+/// [`to_primary`].
+pub fn make_sandbox_token(
+    base: HANDLE,
+    flip_group: Option<&str>,
+) -> Result<HANDLE> {
     // SIDs to disable. `LocalPsid` is RAII over
     // `ConvertStringSidToSidW` and frees with `LocalFree` on drop —
     // the donor used raw `PSID` + `FreeSid` here, which is the wrong
     // free fn for that allocator.
     //
-    // CI uses `group_sid == BUILTIN\Administrators` (the only SID
-    // that's both on the runner's token without a logout AND
+    // CI uses `flip_group == Some(BUILTIN\Administrators)` (the only
+    // SID that's both on the runner's token without a logout AND
     // discriminator-shaped). Dedup so `CreateRestrictedToken`
     // doesn't see the same SID twice in `SidsToDisable`.
-    let group = LocalPsid::from_string(group_sid)
-        .with_context(|| format!("parse group SID '{group_sid}'"))?;
-    let admins;
-    let mut psids: Vec<PSID> = vec![group.as_psid()];
-    if !group_sid.eq_ignore_ascii_case(SID_BUILTIN_ADMINS) {
-        admins = LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
-        psids.push(admins.as_psid());
+    let group;
+    let admins = LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
+    let mut psids: Vec<PSID> = vec![admins.as_psid()];
+    if let Some(gsid) = flip_group
+        && !gsid.eq_ignore_ascii_case(SID_BUILTIN_ADMINS)
+    {
+        group = LocalPsid::from_string(gsid)
+            .with_context(|| format!("parse group SID '{gsid}'"))?;
+        psids.push(group.as_psid());
     }
     let disable: Vec<SID_AND_ATTRIBUTES> = psids
         .into_iter()
@@ -102,7 +111,10 @@ pub fn make_sandbox_token(base: HANDLE, group_sid: &str) -> Result<HANDLE> {
             &mut out,
         )
         .with_context(|| {
-            format!("CreateRestrictedToken(disable=[Admins,{group_sid}])")
+            format!(
+                "CreateRestrictedToken(disable=[Admins{}])",
+                flip_group.map(|g| format!(",{g}")).unwrap_or_default()
+            )
         })?;
     }
     // `admins` / `group` LocalPsid drop here → LocalFree.
@@ -295,7 +307,7 @@ mod tests {
         // Group SID is BUILTIN\Users — always present, so the test
         // doesn't depend on the discriminator group being installed.
         let base = open_self_token().expect("open_self_token");
-        let r = make_sandbox_token(base, "S-1-5-32-545");
+        let r = make_sandbox_token(base, Some("S-1-5-32-545"));
         unsafe {
             let _ = CloseHandle(base);
         }
