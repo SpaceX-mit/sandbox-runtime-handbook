@@ -14,9 +14,9 @@ use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSidToSidW,
 };
 use windows::Win32::Security::{
-    EqualSid, GetTokenInformation, LookupAccountNameW, LookupAccountSidW,
-    PSID, SID_NAME_USE, TokenGroups, TokenUser, TOKEN_GROUPS, TOKEN_QUERY,
-    TOKEN_USER,
+    EqualSid, GetLengthSid, GetTokenInformation, LookupAccountNameW,
+    LookupAccountSidW, PSID, SID_NAME_USE, TokenGroups, TokenUser,
+    TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::System::SystemServices::{
     SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY,
@@ -44,6 +44,13 @@ impl LocalPsid {
 
     pub fn as_psid(&self) -> PSID {
         self.0
+    }
+
+    /// The SID's binary form (`GetLengthSid` bytes at the PSID).
+    /// Borrow lives as long as `self`.
+    pub fn as_bytes(&self) -> &[u8] {
+        let len = unsafe { GetLengthSid(self.0) } as usize;
+        unsafe { std::slice::from_raw_parts(self.0 .0 as *const u8, len) }
     }
 }
 

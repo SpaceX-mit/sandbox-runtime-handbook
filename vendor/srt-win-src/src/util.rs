@@ -159,6 +159,19 @@ impl OwnedSd {
         }
         Ok(Self { ptr: psd, len: sz })
     }
+
+    /// Take ownership of a `PSECURITY_DESCRIPTOR` returned by a Win32
+    /// API documented to require `LocalFree` (e.g.
+    /// `GetNamedSecurityInfoW`). `len` is queried for completeness;
+    /// callers that only need the free-on-drop guard can ignore it.
+    pub fn from_raw(psd: PSECURITY_DESCRIPTOR) -> Self {
+        let len = if psd.0.is_null() {
+            0
+        } else {
+            unsafe { GetSecurityDescriptorLength(psd) }
+        };
+        Self { ptr: psd, len }
+    }
 }
 
 impl Drop for OwnedSd {
