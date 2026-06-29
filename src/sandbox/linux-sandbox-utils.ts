@@ -1,4 +1,4 @@
-import shellquote from 'shell-quote'
+import { quote } from '../utils/shell-quote.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
@@ -667,7 +667,7 @@ export async function initializeLinuxNetworkBridge(
  * multicall-binary prefix that dispatches on the ARGV0 env var.
  *
  * Returns a shell-ready string ending in a trailing space — callers append
- * shellquote.quote([shell, '-c', cmd]). Returns undefined when seccomp is
+ * quote([shell, '-c', cmd]). Returns undefined when seccomp is
  * unavailable (no argv0, no binary found).
  *
  * When argv0 is set, applyPath is used verbatim (no existence check); the
@@ -681,10 +681,10 @@ function resolveApplySeccompPrefix(
     if (!applyPath) {
       throw new Error('seccompConfig.argv0 requires seccompConfig.applyPath')
     }
-    return `ARGV0=${shellquote.quote([argv0])} ${shellquote.quote([applyPath])} `
+    return `ARGV0=${quote([argv0])} ${quote([applyPath])} `
   }
   const binary = getApplySeccompBinaryPath(applyPath)
-  return binary ? `${shellquote.quote([binary])} ` : undefined
+  return binary ? `${quote([binary])} ` : undefined
 }
 
 /**
@@ -703,7 +703,7 @@ function buildSandboxCommand(
   const shellPath = shell || 'bash'
   // Host filesystem is bind-mounted into the sandbox, so an explicit
   // socatPath resolves to the same binary inside bwrap.
-  const socat = shellquote.quote([socatPath ?? 'socat'])
+  const socat = quote([socatPath ?? 'socat'])
   const socatCommands = [
     `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
     `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
@@ -713,15 +713,14 @@ function buildSandboxCommand(
   // apply-seccomp runs after socat so socat can still create Unix sockets.
   if (applySeccompPrefix) {
     const applySeccompCmd =
-      applySeccompPrefix + shellquote.quote([shellPath, '-c', userCommand])
+      applySeccompPrefix + quote([shellPath, '-c', userCommand])
     const innerScript = [...socatCommands, applySeccompCmd].join('\n')
-    return `${shellPath} -c ${shellquote.quote([innerScript])}`
+    return `${shellPath} -c ${quote([innerScript])}`
   } else {
-    const innerScript = [
-      ...socatCommands,
-      `eval ${shellquote.quote([userCommand])}`,
-    ].join('\n')
-    return `${shellPath} -c ${shellquote.quote([innerScript])}`
+    const innerScript = [...socatCommands, `eval ${quote([userCommand])}`].join(
+      '\n',
+    )
+    return `${shellPath} -c ${quote([innerScript])}`
   }
 }
 
@@ -1492,17 +1491,13 @@ export async function wrapCommandWithSandboxLinux(
       )
       bwrapArgs.push(sandboxCommand)
     } else if (applySeccompPrefix) {
-      const applySeccompCmd =
-        applySeccompPrefix + shellquote.quote([shell, '-c', command])
+      const applySeccompCmd = applySeccompPrefix + quote([shell, '-c', command])
       bwrapArgs.push(applySeccompCmd)
     } else {
       bwrapArgs.push(command)
     }
 
-    const wrappedCommand = shellquote.quote([
-      bwrapPath ?? 'bwrap',
-      ...bwrapArgs,
-    ])
+    const wrappedCommand = quote([bwrapPath ?? 'bwrap', ...bwrapArgs])
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')
