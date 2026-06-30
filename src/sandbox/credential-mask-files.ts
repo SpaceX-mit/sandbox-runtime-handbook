@@ -1,23 +1,24 @@
 /**
- * Whole-file credential masking (Linux).
+ * Credential file masking (Linux).
  *
  * For a `credentials.files` entry with `mode: "mask"`, srt reads the real
- * file content on the host, registers a sentinel for it in the
- * {@link SentinelRegistry}, and writes the sentinel to a fake file in a
- * manager-owned temp directory. The Linux sandbox then `--ro-bind`s the
- * fake over the real path, so the sandboxed process reads the sentinel.
- * The proxy substitution from env-var masking already scans every header
- * for any registered sentinel, so a tool that does
+ * file content on the host, registers one or more sentinels in the
+ * {@link SentinelRegistry}, and writes a fake file (sentinel-substituted)
+ * to a manager-owned temp directory. The Linux sandbox then `--ro-bind`s
+ * the fake over the real path, so the sandboxed process reads the
+ * sentinel(s). The proxy substitution from env-var masking already scans
+ * every header for any registered sentinel, so a tool that does
  * `Authorization: Bearer $(cat <maskedFile>)` reaches the upstream with
  * the real bytes — no proxy changes required.
  *
+ * Without `extract`, masking is **whole-file**: one sentinel replaces the
+ * entire content. With `extract`, masking is **structured**: a regex picks
+ * out the credential value(s) and only those spans are replaced, so a tool
+ * that parses the file (JSON/YAML/.netrc) still sees valid syntax. See
+ * {@link extractAndSubstitute} and {@link CredentialFileConfigSchema}.
+ *
  * On macOS, SBPL cannot redirect reads, so masked files degrade to
  * `mode: "deny"` (see macos-sandbox-utils.ts).
- *
- * LIMITATION: this is whole-file masking. It works when the file content
- * *is* the credential (a token file). It does not work for structured
- * files a tool parses (JSON/YAML/.netrc) — the tool will fail to parse
- * the sentinel. See {@link CredentialFileConfigSchema}.
  */
 
 import * as fs from 'node:fs'
@@ -34,6 +35,85 @@ import type { SentinelRegistry } from './credential-sentinel.js'
  * with the env var `GH_TOKEN`.
  */
 const FILE_KEY_PREFIX = 'file:'
+
+/**
+ * Result of {@link extractAndSubstitute}: the file content with each
+ * matched capture-group-1 span replaced by `sentinelFor(capture, i)`,
+ * plus the distinct captured values in first-seen (index) order.
+ */
+export interface ExtractResult {
+  fakeContent: string
+  captures: string[]
+}
+
+/**
+ * `RegExpMatchArray` with the `d`-flag indices array. The project targets
+ * ES2020 so `lib.es2022.regexp` is not loaded, but Node ≥18 (the engine
+ * floor) supports `hasIndices` at runtime.
+ */
+type MatchWithIndices = RegExpMatchArray & {
+  indices: Array<[number, number] | undefined>
+}
+
+/**
+ * Apply `pattern` globally to `content` and return `content` with each
+ * matched capture-group-1 span replaced by `sentinelFor(capture, i)`,
+ * where `i` is the zero-based index of the distinct captured value in
+ * first-seen order.
+ *
+ * Single pass, offset-based: the regex `d` flag exposes capture-group
+ * offsets, so the output is built by slicing between matches and
+ * splicing the sentinel in at the exact `[start, end)` of group 1. Only
+ * the regex-matched span is replaced — a captured value that
+ * coincidentally appears elsewhere in the file (outside any match) is
+ * left intact. No placeholder pass, no substring-ordering concern.
+ *
+ * Returns `null` when the pattern matches nothing — the caller treats that
+ * as fail-open (skip the entry, leave the file readable as-is) with a loud
+ * stderr warning. A non-matching pattern is a config mistake for the
+ * operator to fix; see {@link buildMaskedFileBinds} for the rationale.
+ *
+ * Throws when a match has no group-1 capture. The schema already rejects
+ * patterns with zero groups, so this only fires when group 1 is optional
+ * and absent for some match (e.g. `"token: (\\S+)?"`); accepting that
+ * would silently mask nothing for that occurrence.
+ *
+ * Pure on `content`/`pattern`; the callback may close over a registry.
+ */
+export function extractAndSubstitute(
+  content: string,
+  pattern: string,
+  sentinelFor: (capture: string, index: number) => string,
+): ExtractResult | null {
+  // The schema validates `pattern` compiles; `g` makes matchAll iterate
+  // every occurrence and `d` populates `m.indices` with group offsets.
+  const re = new RegExp(pattern, 'gd')
+  const indexByCapture = new Map<string, number>()
+  let out = ''
+  let pos = 0
+  for (const m of content.matchAll(re) as IterableIterator<MatchWithIndices>) {
+    const cap = m[1]
+    if (cap === undefined) {
+      throw new Error(
+        `extract pattern /${pattern}/ matched at offset ${m.index} but ` +
+          `capture group 1 is undefined — group 1 must capture the ` +
+          `credential value on every match.`,
+      )
+    }
+    // Empty captures are skipped: a zero-width span has nothing to mask.
+    if (cap.length === 0) continue
+    let i = indexByCapture.get(cap)
+    if (i === undefined) indexByCapture.set(cap, (i = indexByCapture.size))
+    const [start, end] = m.indices[1]!
+    out += content.slice(pos, start) + sentinelFor(cap, i)
+    pos = end
+  }
+  if (indexByCapture.size === 0) return null
+  return {
+    fakeContent: out + content.slice(pos),
+    captures: [...indexByCapture.keys()],
+  }
+}
 
 /** One masked file's bind mapping for the platform builder. */
 export interface MaskedFileBind {
@@ -107,8 +187,21 @@ export class MaskedFileStore {
 
 /**
  * For each `mode: "mask"` file entry: resolve the path, read the real
- * content, register `(file:<path>, content, injectHosts)` in `registry`,
- * write the sentinel to a fake file via `store`, and return the bind list.
+ * content, build the fake content (whole-file or structured per `extract`),
+ * register sentinels in `registry`, write the fake via `store`, and return
+ * the bind list.
+ *
+ * Whole-file mode (no `extract`): one sentinel keyed `file:<path>` whose
+ * real value is the entire file content; the fake file *is* the sentinel.
+ *
+ * Structured mode (`extract` set): one sentinel per distinct captured
+ * value, keyed `file:<path>#<i>`; the fake file is the real content with
+ * each captured span replaced by its sentinel. If the regex matches
+ * nothing the entry is **skipped with a loud stderr warning** — fail-open:
+ * no bind, no deny, the file stays readable via the root mount. The
+ * operator's regex is treated as a config error to surface and fix, not a
+ * reason to block file access; a wrong pattern should not break a tool
+ * that needs the file when the credential is legitimately absent.
  *
  * Entries whose path does not exist, is unreadable, or resolves to a
  * directory are skipped with a debug log — same posture as a masked env
@@ -142,14 +235,15 @@ export function buildMaskedFileBinds(
       }
       // Read as bytes first: a utf8 read silently maps invalid sequences
       // to U+FFFD, so the sentinel would round-trip to corrupted bytes at
-      // the proxy. Whole-file masking is for token files; reject binary.
+      // the proxy. Masking (whole-file or extract) is for text credential
+      // files; reject binary.
       const raw = fs.readFileSync(realPath)
       content = raw.toString('utf8')
       if (Buffer.byteLength(content, 'utf8') !== raw.length) {
         logForDebugging(
           `[credential-mask] Skipping masked file with non-UTF-8 content ` +
-            `(binary credential files are not supported in whole-file ` +
-            `mask mode): ${f.path}`,
+            `(binary credential files are not supported in mask mode): ` +
+            `${f.path}`,
           { level: 'warn' },
         )
         continue
@@ -164,8 +258,33 @@ export function buildMaskedFileBinds(
 
     const injectHosts = f.injectHosts ?? allowedDomains
     const key = FILE_KEY_PREFIX + realPath
-    const sentinel = registry.register(key, content, injectHosts)
-    const fakePath = store.write(key, sentinel)
+
+    let fakeContent: string
+    if (f.extract === undefined) {
+      // Whole-file: one sentinel for the entire content.
+      fakeContent = registry.register(key, content, injectHosts)
+    } else {
+      const extracted = extractAndSubstitute(content, f.extract, (cap, i) =>
+        registry.register(`${key}#${i}`, cap, injectHosts),
+      )
+      if (extracted === null) {
+        // Fail-open: a non-matching extract pattern is a config error to
+        // surface, not a reason to block file access. Skip the entry (no
+        // bind, no deny) — the file stays readable via the root mount —
+        // and warn loudly on stderr so the operator fixes the regex.
+        const msg =
+          `[sandbox-runtime] WARNING: credentials.files entry ` +
+          `"${f.path}" has extract pattern "${f.extract}" that matched ` +
+          `nothing in the file. The file is left UNPROTECTED (readable ` +
+          `as-is inside the sandbox). Fix the regex or remove the entry.`
+        console.warn(msg)
+        logForDebugging(msg, { level: 'warn' })
+        continue
+      }
+      fakeContent = extracted.fakeContent
+    }
+
+    const fakePath = store.write(key, fakeContent)
     binds.push({ realPath, fakePath })
   }
   return binds

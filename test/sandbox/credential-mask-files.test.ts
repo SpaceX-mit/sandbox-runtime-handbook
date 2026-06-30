@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
+import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
 import {
   existsSync,
@@ -21,6 +21,7 @@ import { join } from 'node:path'
 import {
   MaskedFileStore,
   buildMaskedFileBinds,
+  extractAndSubstitute,
   MASKED_FILE_STORE_PREFIX,
 } from '../../src/sandbox/credential-mask-files.js'
 import {
@@ -42,9 +43,18 @@ const TOKEN_FILE = join(FIXTURE_DIR, 'gh-token')
 const TOKEN_CONTENT = 'ghp_realsecret_abcdef0123456789'
 const SUBDIR = join(FIXTURE_DIR, 'aws-dir')
 
+const HOSTS_YML = join(FIXTURE_DIR, 'hosts.yml')
+const HOSTS_TOKEN = 'gho_realsecret_zyx9876543210'
+const HOSTS_CONTENT =
+  'github.com:\n' +
+  '    user: alice\n' +
+  `    oauth_token: ${HOSTS_TOKEN}\n` +
+  '    git_protocol: https\n'
+
 beforeAll(() => {
   mkdirSync(SUBDIR, { recursive: true })
   writeFileSync(TOKEN_FILE, TOKEN_CONTENT)
+  writeFileSync(HOSTS_YML, HOSTS_CONTENT)
 })
 
 afterAll(() => {
@@ -102,6 +112,110 @@ describe('MaskedFileStore', () => {
     expect(existsSync(dir)).toBe(false)
     expect(store.dirPath).toBeUndefined()
     store.dispose() // no-op, no throw
+  })
+})
+
+describe('extractAndSubstitute', () => {
+  // Deterministic sentinel callback for unit tests: <S0>, <S1>, …
+  const S = (_: string, i: number) => `<S${i}>`
+
+  test('single match: capture replaced by sentinel, rest preserved', () => {
+    const content = 'github.com:\n  oauth_token: ghp_real\n  user: alice\n'
+    const out = extractAndSubstitute(content, 'oauth_token:\\s*(\\S+)', S)
+    expect(out).not.toBeNull()
+    expect(out!.captures).toEqual(['ghp_real'])
+    expect(out!.fakeContent).toBe(
+      'github.com:\n  oauth_token: <S0>\n  user: alice\n',
+    )
+    expect(out!.fakeContent).not.toContain('ghp_real')
+  })
+
+  test('multiple distinct matches each get their own sentinel index', () => {
+    const content =
+      'machine a.example.com password tok-A\n' +
+      'machine b.example.com password tok-B\n'
+    const out = extractAndSubstitute(content, 'password\\s+(\\S+)', S)!
+    expect(out.captures).toEqual(['tok-A', 'tok-B'])
+    expect(out.fakeContent).toBe(
+      'machine a.example.com password <S0>\n' +
+        'machine b.example.com password <S1>\n',
+    )
+  })
+
+  test('duplicate captures dedupe to one sentinel index', () => {
+    const content = 'password tok-X\npassword tok-X\npassword tok-Y\n'
+    const out = extractAndSubstitute(content, 'password (\\S+)', S)!
+    expect(out.captures).toEqual(['tok-X', 'tok-Y'])
+    expect(out.fakeContent).toBe(
+      'password <S0>\npassword <S0>\npassword <S1>\n',
+    )
+  })
+
+  test('returns null when the pattern matches nothing', () => {
+    expect(
+      extractAndSubstitute('no creds here', 'password (\\S+)', S),
+    ).toBeNull()
+  })
+
+  test('throws when a match leaves group 1 undefined', () => {
+    // Optional group that does not participate — accepting this would
+    // mask nothing for that occurrence, so the helper refuses.
+    expect(() =>
+      extractAndSubstitute('token: \n', 'token: (\\S+)?', S),
+    ).toThrow(/capture group 1/)
+  })
+
+  test('only the regex-matched span is replaced; coincidental occurrences elsewhere are left intact', () => {
+    // The captured value `abc123` also appears in a comment line that the
+    // regex does not match. Offset-based replacement touches only group 1
+    // of each match, so the comment is preserved byte-for-byte. The old
+    // value-based pass would have rewritten both.
+    const content =
+      'oauth_token: abc123\n' + '# note: the token abc123 is stored above\n'
+    const out = extractAndSubstitute(content, 'oauth_token:\\s*(\\S+)', S)!
+    expect(out.captures).toEqual(['abc123'])
+    expect(out.fakeContent).toBe(
+      'oauth_token: <S0>\n' + '# note: the token abc123 is stored above\n',
+    )
+  })
+
+  test('a capture that is a substring of another does not corrupt the longer one', () => {
+    // tok is a prefix of tok-long; offset-based replacement touches only
+    // each match's own group-1 span, so neither capture corrupts the other.
+    const content = 'a=tok-long b=tok'
+    const out = extractAndSubstitute(content, '[ab]=(\\S+)', S)!
+    expect(out.captures).toEqual(['tok-long', 'tok'])
+    expect(out.fakeContent).toBe('a=<S0> b=<S1>')
+  })
+
+  test('overlapping pattern matches are handled by the regex engine, not us', () => {
+    // matchAll with /g does not return overlapping matches, so the
+    // helper sees only the engine's non-overlapping set. This test pins
+    // that assumption: 'aaa' against /(aa)/g matches once at index 0.
+    const out = extractAndSubstitute('aaa', '(aa)', S)!
+    expect(out.captures).toEqual(['aa'])
+    expect(out.fakeContent).toBe('<S0>a')
+  })
+
+  test('empty captures are skipped, not turned into sentinels', () => {
+    // (\S*) can capture the empty string at end-of-line; a zero-width
+    // span has nothing to mask, so the helper leaves it as-is.
+    const out = extractAndSubstitute('k=v\nk=\n', 'k=(\\S*)', S)!
+    expect(out.captures).toEqual(['v'])
+    expect(out.fakeContent).toBe('k=<S0>\nk=\n')
+  })
+
+  test('callback receives the captured value and its dedupe index', () => {
+    const calls: Array<[string, number]> = []
+    extractAndSubstitute('k=A k=B k=A', 'k=(\\S+)', (cap, i) => {
+      calls.push([cap, i])
+      return '_'
+    })
+    expect(calls).toEqual([
+      ['A', 0],
+      ['B', 1],
+      ['A', 0],
+    ])
   })
 })
 
@@ -226,7 +340,208 @@ describe('buildMaskedFileBinds', () => {
     expect(binds).toHaveLength(0)
     store.dispose()
   })
+
+  test('extract: fake preserves structure with sentinel substituted in', () => {
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const binds = buildMaskedFileBinds(
+      [
+        {
+          path: HOSTS_YML,
+          mode: 'mask',
+          extract: 'oauth_token:\\s*(\\S+)',
+          injectHosts: ['api.github.com'],
+        },
+      ],
+      ['api.github.com'],
+      reg,
+      store,
+    )
+    expect(binds).toHaveLength(1)
+    const fake = readFileSync(binds[0]!.fakePath, 'utf8')
+    // Structure preserved byte-for-byte except the token span.
+    expect(fake).toContain('github.com:\n')
+    expect(fake).toContain('    user: alice\n')
+    expect(fake).toContain('    git_protocol: https\n')
+    expect(fake).not.toContain(HOSTS_TOKEN)
+    // The token was replaced by a sentinel registered for #0.
+    const m = fake.match(/oauth_token: (\S+)/)
+    expect(m![1]!.startsWith(SENTINEL_PREFIX)).toBe(true)
+    expect(reg.lookupReal(m![1]!)).toBe(HOSTS_TOKEN)
+    expect(reg.size).toBe(1)
+    store.dispose()
+  })
+
+  test('extract with no match leaves the file unprotected and warns', () => {
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const binds = buildMaskedFileBinds(
+      [{ path: HOSTS_YML, mode: 'mask', extract: 'no_such_key: (\\S+)' }],
+      ['api.github.com'],
+      reg,
+      store,
+    )
+    // Fail-open: no bind — the entry is skipped entirely so the real
+    // file stays readable via the root mount.
+    expect(binds).toHaveLength(0)
+    expect(reg.size).toBe(0)
+    expect(store.dirPath).toBeUndefined()
+    // A loud stderr warning surfaces the config error to the operator.
+    expect(warnSpy).toHaveBeenCalledTimes(1)
+    const msg = warnSpy.mock.calls[0]![0] as string
+    expect(msg).toContain('UNPROTECTED')
+    expect(msg).toContain(HOSTS_YML)
+    expect(msg).toContain('no_such_key: (\\S+)')
+    warnSpy.mockRestore()
+    store.dispose()
+  })
 })
+
+/**
+ * Linux integration for structured (extract) masking via SandboxManager:
+ * the bound fake preserves the file's structure with the credential span
+ * replaced by a sentinel.
+ */
+describe.if(isLinux)('structured file masking on Linux (extract)', () => {
+  const TEST_DIR = join(tmpdir(), 'srt-credmask-extract-' + Date.now())
+  const YML_FILE = join(TEST_DIR, 'hosts.yml')
+  const YML_TOKEN = 'gho_struct_real_0123456789abcdef'
+  const YML_CONTENT =
+    'github.com:\n' +
+    '    user: alice\n' +
+    `    oauth_token: ${YML_TOKEN}\n` +
+    '    git_protocol: https\n'
+
+  function runInSandbox(wrappedCommand: string) {
+    return spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+  }
+
+  beforeAll(async () => {
+    mkdirSync(TEST_DIR, { recursive: true })
+    writeFileSync(YML_FILE, YML_CONTENT)
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: ['localhost'], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+      credentials: {
+        files: [
+          {
+            path: YML_FILE,
+            mode: 'mask',
+            extract: 'oauth_token:\\s*(\\S+)',
+          },
+        ],
+        allowPlaintextInject: true,
+      },
+    })
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    rmSync(TEST_DIR, { recursive: true, force: true })
+  })
+
+  test('cat inside the sandbox preserves YAML structure with sentinel', async () => {
+    const wrapped = await SandboxManager.wrapWithSandbox(`cat ${YML_FILE}`)
+    expect(wrapped).not.toContain(YML_TOKEN)
+    const result = runInSandbox(wrapped)
+    expect(result.status).toBe(0)
+    const seen = result.stdout
+    // Every non-credential line is byte-identical to the real file.
+    expect(seen).toContain('github.com:\n')
+    expect(seen).toContain('    user: alice\n')
+    expect(seen).toContain('    git_protocol: https\n')
+    // The credential value is gone; a sentinel sits in its place.
+    expect(seen).not.toContain(YML_TOKEN)
+    const m = seen.match(/oauth_token: (\S+)/)
+    expect(m).not.toBeNull()
+    expect(m![1]!.startsWith(SENTINEL_PREFIX)).toBe(true)
+    // Same line count and same length modulo the swapped span — the
+    // rest of the file is untouched.
+    expect(seen.split('\n')).toHaveLength(YML_CONTENT.split('\n').length)
+    // The host-side registry maps that sentinel back to the real token.
+    expect(SandboxManager.getSentinelRegistry().lookupReal(m![1]!)).toBe(
+      YML_TOKEN,
+    )
+  })
+
+  test('the masked file is read-only inside the sandbox', async () => {
+    const wrapped = await SandboxManager.wrapWithSandbox(
+      `sh -c 'echo pwned > ${YML_FILE}'`,
+    )
+    const result = runInSandbox(wrapped)
+    expect(result.status).not.toBe(0)
+    expect(readFileSync(YML_FILE, 'utf8')).toBe(YML_CONTENT)
+  })
+})
+
+/**
+ * Linux: an `extract` pattern that matches nothing fails open — the
+ * entry is skipped (no bind, no deny), the file stays readable via the
+ * root mount, and a loud warning is emitted to stderr so the operator
+ * fixes the regex.
+ */
+describe.if(isLinux)(
+  'extract no-match leaves file readable and warns on Linux',
+  () => {
+    const TEST_DIR = join(tmpdir(), 'srt-credmask-nomatch-' + Date.now())
+    const SECRET_FILE = join(TEST_DIR, 'hosts.yml')
+    const SECRET = 'gho_nomatch_real_0123456789'
+
+    beforeAll(async () => {
+      mkdirSync(TEST_DIR, { recursive: true })
+      writeFileSync(SECRET_FILE, `oauth_token: ${SECRET}\n`)
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: ['localhost'], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+        credentials: {
+          files: [
+            {
+              path: SECRET_FILE,
+              mode: 'mask',
+              extract: 'will_not_match_(\\S+)',
+            },
+          ],
+          allowPlaintextInject: true,
+        },
+      })
+    })
+
+    afterAll(async () => {
+      await SandboxManager.reset()
+      rmSync(TEST_DIR, { recursive: true, force: true })
+    })
+
+    test('the file is readable as-is inside the sandbox (fail-open)', async () => {
+      const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+      const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
+      // A loud stderr warning surfaces the config error at wrap time.
+      expect(warnSpy).toHaveBeenCalled()
+      expect(warnSpy.mock.calls[0]![0] as string).toContain('UNPROTECTED')
+      warnSpy.mockRestore()
+      // No fake-file bind and no /dev/null deny bind are emitted for the
+      // path — the entry is skipped entirely.
+      expect(wrapped).not.toMatch(
+        new RegExp(`--ro-bind \\S+ ${SECRET_FILE.replace(/\//g, '\\/')}\\b`),
+      )
+      const result = spawnSync(wrapped, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 10000,
+      })
+      // cat succeeds and returns the real bytes: fail-open means the
+      // file is left readable via the root mount.
+      expect(result.status).toBe(0)
+      expect(result.stdout).toBe(`oauth_token: ${SECRET}\n`)
+    })
+  },
+)
 
 /**
  * macOS: SBPL cannot redirect a read, so a masked file degrades to a
@@ -258,6 +573,39 @@ describe('file masking on macOS degrades to read-deny', () => {
     })
     expect(wrapped).not.toBe('echo hi')
     expect(wrapped).toContain('deny file-read*')
+  })
+
+  test('an extract-mode masked file still degrades to (deny file-read*)', () => {
+    // extract changes only the fake-file CONTENT; the macOS path keys
+    // off the bind list, not the content, so structured masking is
+    // exactly as unsupported as whole-file masking — the file is denied.
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const binds = buildMaskedFileBinds(
+      [
+        {
+          path: HOSTS_YML,
+          mode: 'mask',
+          extract: 'oauth_token:\\s*(\\S+)',
+        },
+      ],
+      ['api.github.com'],
+      reg,
+      store,
+    )
+    const wrapped = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: false,
+      readConfig: undefined,
+      writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+      maskedFileBinds: binds,
+    })
+    expect(wrapped).toContain('deny file-read*')
+    expect(wrapped).toContain(HOSTS_YML)
+    expect(wrapped).not.toContain(binds[0]!.fakePath)
+    // The real credential never reaches the profile.
+    expect(wrapped).not.toContain(HOSTS_TOKEN)
+    store.dispose()
   })
 })
 
@@ -560,3 +908,185 @@ describe.if(isLinux)('end-to-end file masking via SandboxManager', () => {
     expect(lastHeaders?.authorization).not.toContain(SECRET_CONTENT)
   }, 20000)
 })
+
+/**
+ * End-to-end structured (extract) masking: a multi-credential file is
+ * masked with a regex; inside the sandbox a tool parses the sentinel out
+ * of the preserved structure and sends it as a header; the proxy swaps
+ * each sentinel to its own real captured value at the injectHost.
+ */
+describe.if(isLinux)(
+  'end-to-end structured file masking via SandboxManager',
+  () => {
+    const TEST_DIR = join(tmpdir(), 'srt-credmask-extract-e2e-' + Date.now())
+    const HOST_A = 'localhost'
+    const HOST_B = 'localtest.me'
+
+    // hosts.yml-style: one credential, structure must survive.
+    const YML_FILE = join(TEST_DIR, 'hosts.yml')
+    const YML_TOKEN = 'gho_e2e_real_0123456789abcdef'
+    const YML_CONTENT =
+      'github.com:\n' +
+      '    user: alice\n' +
+      `    oauth_token: ${YML_TOKEN}\n` +
+      '    git_protocol: https\n'
+
+    // .netrc-style: two credentials → two sentinels, each must swap to
+    // its own real value at the proxy.
+    const NETRC_FILE = join(TEST_DIR, 'netrc')
+    const NETRC_TOK_A = 'npm_e2e_real_aaaaaaaa'
+    const NETRC_TOK_B = 'npm_e2e_real_bbbbbbbb'
+    const NETRC_CONTENT =
+      `machine a.example.com login alice password ${NETRC_TOK_A}\n` +
+      `machine b.example.com login bob password ${NETRC_TOK_B}\n`
+
+    let upstream: Server
+    let upstreamPort: number
+    let lastHeaders: IncomingHttpHeaders | undefined
+
+    beforeAll(async () => {
+      mkdirSync(TEST_DIR, { recursive: true })
+      writeFileSync(YML_FILE, YML_CONTENT)
+      writeFileSync(NETRC_FILE, NETRC_CONTENT)
+
+      upstream = createHttpServer((req, res) => {
+        lastHeaders = req.headers
+        res.writeHead(200)
+        res.end('ok')
+      })
+      await new Promise<void>(r => upstream.listen(0, '127.0.0.1', () => r()))
+      upstreamPort = (upstream.address() as AddressInfo).port
+
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [HOST_A, HOST_B], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+        credentials: {
+          files: [
+            {
+              path: YML_FILE,
+              mode: 'mask',
+              extract: 'oauth_token:\\s*(\\S+)',
+              injectHosts: [HOST_A],
+            },
+            {
+              path: NETRC_FILE,
+              mode: 'mask',
+              extract: 'password\\s+(\\S+)',
+              injectHosts: [HOST_A],
+            },
+          ],
+          allowPlaintextInject: true,
+        },
+      })
+    })
+
+    afterAll(async () => {
+      await SandboxManager.reset()
+      await new Promise<void>(r => upstream.close(() => r()))
+      rmSync(TEST_DIR, { recursive: true, force: true })
+    })
+
+    function runInSandbox(wrappedCommand: string) {
+      return spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 10000,
+      })
+    }
+
+    async function curlViaManagerProxy(
+      url: string,
+      bearer: string,
+      resolve?: string,
+    ): Promise<number> {
+      const proxyPort = SandboxManager.getProxyPort()!
+      const authToken = SandboxManager.getProxyAuthToken()!
+      const args = [
+        '-sS',
+        '--max-time',
+        '10',
+        '--proxy',
+        `http://srt:${authToken}@127.0.0.1:${proxyPort}`,
+        '-H',
+        `Authorization: Bearer ${bearer}`,
+      ]
+      if (resolve) args.push('--resolve', resolve)
+      args.push(url)
+      const child = spawn('curl', args)
+      child.stdout.on('data', () => {})
+      child.stderr.on('data', () => {})
+      return new Promise(r => child.on('close', code => r(code ?? 1)))
+    }
+
+    test('hosts.yml: parse sentinel from structure → upstream gets real token', async () => {
+      // bwrap leg: extract the oauth_token field from the masked YAML
+      // inside the sandbox — the file parses, and the field value is
+      // the sentinel.
+      const wrapped = await SandboxManager.wrapWithSandbox(
+        `sh -c "grep oauth_token ${YML_FILE} | awk '{print \\$2}'"`,
+      )
+      expect(wrapped).not.toContain(YML_TOKEN)
+      const result = runInSandbox(wrapped)
+      expect(result.status).toBe(0)
+      const sentinel = result.stdout.trim()
+      expect(sentinel.startsWith(SENTINEL_PREFIX)).toBe(true)
+      expect(sentinel).not.toContain(YML_TOKEN)
+
+      // Proxy leg: the sentinel reaches HOST_A as the real token.
+      lastHeaders = undefined
+      const exit = await curlViaManagerProxy(
+        `http://${HOST_A}:${upstreamPort}/`,
+        sentinel,
+      )
+      expect(exit).toBe(0)
+      expect(lastHeaders?.authorization).toBe(`Bearer ${YML_TOKEN}`)
+    }, 20000)
+
+    test('.netrc: two captures → two sentinels, each swaps to its own value', async () => {
+      // bwrap leg: read both password fields inside the sandbox.
+      const wrapped = await SandboxManager.wrapWithSandbox(
+        `sh -c "awk '{print \\$NF}' ${NETRC_FILE}"`,
+      )
+      const result = runInSandbox(wrapped)
+      expect(result.status).toBe(0)
+      const [sA, sB] = result.stdout.trim().split('\n')
+      expect(sA!.startsWith(SENTINEL_PREFIX)).toBe(true)
+      expect(sB!.startsWith(SENTINEL_PREFIX)).toBe(true)
+      expect(sA).not.toBe(sB)
+      expect(result.stdout).not.toContain(NETRC_TOK_A)
+      expect(result.stdout).not.toContain(NETRC_TOK_B)
+
+      // Proxy leg: each sentinel swaps to its own real captured value.
+      lastHeaders = undefined
+      let exit = await curlViaManagerProxy(
+        `http://${HOST_A}:${upstreamPort}/`,
+        sA!,
+      )
+      expect(exit).toBe(0)
+      expect(lastHeaders?.authorization).toBe(`Bearer ${NETRC_TOK_A}`)
+
+      lastHeaders = undefined
+      exit = await curlViaManagerProxy(`http://${HOST_A}:${upstreamPort}/`, sB!)
+      expect(exit).toBe(0)
+      expect(lastHeaders?.authorization).toBe(`Bearer ${NETRC_TOK_B}`)
+    }, 20000)
+
+    test('an extract sentinel does not substitute at a non-injectHost', async () => {
+      const wrapped = await SandboxManager.wrapWithSandbox(
+        `sh -c "grep oauth_token ${YML_FILE} | awk '{print \\$2}'"`,
+      )
+      const sentinel = runInSandbox(wrapped).stdout.trim()
+
+      lastHeaders = undefined
+      const exit = await curlViaManagerProxy(
+        `http://${HOST_B}:${upstreamPort}/`,
+        sentinel,
+        `${HOST_B}:${upstreamPort}:127.0.0.1`,
+      )
+      expect(exit).toBe(0)
+      expect(lastHeaders?.authorization).toBe(`Bearer ${sentinel}`)
+      expect(lastHeaders?.authorization).not.toContain(YML_TOKEN)
+    }, 20000)
+  },
+)

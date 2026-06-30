@@ -72,6 +72,20 @@ describe('SentinelRegistry', () => {
     expect(reg.size).toBe(2)
   })
 
+  test('per-extract file keys (file:<path>#<i>) yield distinct sentinels', () => {
+    // Structured file masking registers one sentinel per distinct
+    // captured value under a #<i>-suffixed key. The registry must treat
+    // these as independent entries so each capture swaps to its own real
+    // value at the proxy.
+    const reg = new SentinelRegistry()
+    const s0 = reg.register('file:/p#0', 'tok-a', ['h.example.com'])
+    const s1 = reg.register('file:/p#1', 'tok-b', ['h.example.com'])
+    expect(s0).not.toBe(s1)
+    expect(reg.lookupReal(s0)).toBe('tok-a')
+    expect(reg.lookupReal(s1)).toBe('tok-b')
+    expect(reg.size).toBe(2)
+  })
+
   test('clear drops every mapping', () => {
     const reg = new SentinelRegistry()
     const s = reg.register('T', 'x', [])
