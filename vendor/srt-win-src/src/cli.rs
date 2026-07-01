@@ -1,4 +1,12 @@
-//! `srt-win` — CLI for the sandbox-runtime Windows network fence.
+//! `srt-win` CLI dispatch — exposed as a library entry point so an
+//! embedding multicall binary can link the crate and route to it when
+//! `argv[1] == `[`SRT_WIN_DISPATCH_ARG1`] instead of shipping a
+//! separate `srt-win.exe`. Dispatch keys on `argv[1]`, not `argv[0]`:
+//! Windows cannot preserve a spoofed `argv[0]` across
+//! `CreateProcessWithLogonW` / `ShellExecuteExW(runas)`, so a
+//! Unix-style multicall-on-argv0 would lose the route on every
+//! internal re-spawn. The standalone binary (`main.rs`) is a
+//! one-line shim over [`run_from_args`].
 //!
 //! Subcommands:
 //!   install | uninstall                — convenience: group + WFP in one
@@ -13,13 +21,71 @@
 //! `status` subcommands write one line of JSON to stdout and exit 0.
 //! Mutating subcommands require elevation and write human-readable
 //! progress to stderr. `exec` propagates the child's exit code.
+//!
+//! Several arms call `std::process::exit` directly (exec's child
+//! propagation, install's structured exit codes, self-elevate's
+//! cancel path). [`run_from_args`] therefore returns the exit code
+//! only for the fall-through (`Ok` → 0, `Err` → 1) cases; an
+//! embedder must be prepared for the process to exit from inside the
+//! dispatch.
+
+// Re-alias so paths from this file's prior life as the [[bin]]
+// crate root (`srt_win::…`) keep resolving now that it's a lib
+// module.
+use crate as srt_win;
 
 use clap::{Args, Parser, Subcommand};
+use std::ffi::OsString;
 
-/// Default group name. Lives here (not in the `#[cfg(windows)]`
-/// library crate) so the clap-derive CLI structs compile on
-/// non-Windows hosts where the library is empty.
 const DEFAULT_GROUP_NAME: &str = "sandbox-runtime-net";
+
+/// `argv[1]` sentinel an embedding multicall binary's dispatcher
+/// matches against to route into [`run_from_args`]. The two internal
+/// re-spawn sites (`logon::spawn_runner`, [`maybe_self_elevate`])
+/// always emit it, so the dispatch survives the
+/// `CreateProcessWithLogonW` runner hop and the
+/// `ShellExecuteExW(runas)` elevation hop — neither of which can
+/// preserve a spoofed `argv[0]` on Windows. [`run_from_args`] strips
+/// it before clap, so the standalone binary accepts it harmlessly.
+pub const SRT_WIN_DISPATCH_ARG1: &str = "--srt-win";
+
+/// Library entry point for the `srt-win` CLI. Parses `args` (with
+/// `args[0]` as the binary name, same convention as
+/// `std::env::args_os()`), runs the matching subcommand, and returns
+/// the process exit code for the fall-through paths. See the module
+/// doc for the arms that `process::exit` directly.
+///
+/// `--help` / `--version` / parse errors print to the appropriate
+/// stream and `process::exit` (clap's `parse_from` behaviour).
+///
+/// **Multicall dispatch.** An embedder's `main()` checks
+/// `argv[1] == SRT_WIN_DISPATCH_ARG1` and on match calls
+/// `run_from_args(argv)` with the FULL argv (sentinel included);
+/// `run_from_args` strips the sentinel before clap. The sentinel
+/// survives every internal re-spawn — both `logon::spawn_runner`
+/// (the runtime `exec` / `wfp verify` / `user trust-ca` hop) and
+/// [`maybe_self_elevate`] (the `install` / `uninstall` / `group …` /
+/// `wfp install|uninstall` UAC hop) emit it as the first parameter,
+/// and the child binary is always `current_exe()` — so the
+/// embedder's dispatcher routes back into `srt-win` regardless of
+/// what `argv[0]` the OS sets.
+pub fn run_from_args<I, T>(args: I) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString>,
+{
+    let mut args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    if args.get(1).map(OsString::as_os_str) == Some(SRT_WIN_DISPATCH_ARG1.as_ref()) {
+        args.remove(1);
+    }
+    match run(Cli::parse_from(&args), &args) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("srt-win: error: {e:#}");
+            1
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "srt-win", version, about)]
@@ -391,7 +457,6 @@ enum AclCmd {
 /// never mid-batch.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(not(windows), allow(dead_code))]
 struct RestoreEntry {
     path: String,
     status: &'static str,
@@ -409,7 +474,6 @@ struct RestoreEntry {
 /// `parent_stamps` row was kept for the next pass to retry.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(not(windows), allow(dead_code))]
 struct ParentEntry {
     path: String,
     status: &'static str,
@@ -419,7 +483,6 @@ struct ParentEntry {
 
 /// Top-level shape of `acl restore --json` / `acl recover --json`.
 #[derive(serde::Serialize)]
-#[cfg_attr(not(windows), allow(dead_code))]
 struct RestoreResult {
     paths: Vec<RestoreEntry>,
     parents: Vec<ParentEntry>,
@@ -428,7 +491,6 @@ struct RestoreResult {
     aces: Vec<AceReleaseEntry>,
 }
 
-#[cfg(windows)]
 fn parent_entries_from(
     entries: &[(String, srt_win::state_db::ParentRestoreOutcome)],
 ) -> Vec<ParentEntry> {
@@ -447,7 +509,6 @@ fn parent_entries_from(
         .collect()
 }
 
-#[cfg(windows)]
 fn restore_entry(
     snap: &srt_win::state_db::Snapshot,
     out: &srt_win::state_db::RestoreOutcome,
@@ -483,7 +544,6 @@ fn restore_entry(
 /// "9 newly stamped, …, 1 FAILED — rolled back" rather than
 /// all-zeros).
 #[derive(Default)]
-#[cfg_attr(not(windows), allow(dead_code))]
 struct StampTally {
     fresh: u32,
     restamped: u32,
@@ -492,7 +552,6 @@ struct StampTally {
     lost: u32,
 }
 
-#[cfg(windows)]
 impl StampTally {
     fn from_witnesses(ws: &[srt_win::state_db::StampWitness]) -> Self {
         use srt_win::state_db::StampAction;
@@ -530,7 +589,6 @@ impl StampTally {
 ///
 /// Shared by `acl stamp` and `exec --deny-*` so the glob/root
 /// rejection — the security-relevant guard — has one copy.
-#[cfg(windows)]
 #[allow(clippy::type_complexity)]
 fn canonicalize_deny_targets(
     deny_read: &[String],
@@ -579,7 +637,6 @@ fn canonicalize_deny_targets(
 /// Directories are accepted; volume roots are accepted too (an
 /// additive ACE on `C:\` is wide but not destructive — the user can
 /// remove it). Globs are a hard error.
-#[cfg(windows)]
 #[allow(clippy::type_complexity)]
 fn canonicalize_ace_targets(
     label: &str,
@@ -612,7 +669,6 @@ fn canonicalize_ace_targets(
 /// certificate (PEM, base64, or raw DER input — see
 /// [`srt_win::cert_store::CertDer::from_pem_or_der`]). Used by
 /// `user trust-ca`.
-#[cfg(windows)]
 fn read_ca_der(path: &str) -> anyhow::Result<srt_win::cert_store::CertDer> {
     use anyhow::Context;
     srt_win::cert_store::CertDer::from_pem_or_der(
@@ -630,7 +686,6 @@ fn read_ca_der(path: &str) -> anyhow::Result<srt_win::cert_store::CertDer> {
 /// is fail-closed and crash-recovery reaps it once `holder` is
 /// observed dead by the next `with_init_lock`, so `failed > 0` is
 /// logged but never changes the child's exit code.
-#[cfg(windows)]
 #[allow(clippy::large_enum_variant)]
 enum PerExecRestore {
     /// Same-user model: PROTECTED-stamp restore via
@@ -650,7 +705,6 @@ enum PerExecRestore {
     },
 }
 
-#[cfg(windows)]
 impl PerExecRestore {
     fn holder(&self) -> srt_win::state_db::HolderPid {
         match self {
@@ -659,7 +713,6 @@ impl PerExecRestore {
     }
 }
 
-#[cfg(windows)]
 impl Drop for PerExecRestore {
     fn drop(&mut self) {
         use srt_win::state_db;
@@ -731,7 +784,6 @@ impl Drop for PerExecRestore {
 /// Shared by the session-level (`--holder-pid`) and per-exec
 /// (`--deny-*`) fence sites so the recipe for "what gets fenced"
 /// — and the diagnostic that says so — has one copy.
-#[cfg(windows)]
 fn open_holder_fences(
     holder: srt_win::state_db::HolderPid,
     label: &str,
@@ -772,7 +824,6 @@ fn open_holder_fences(
 
 #[derive(serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(not(windows), allow(dead_code))]
 struct AclStampInput {
     #[serde(default)]
     deny_read: Vec<String>,
@@ -781,7 +832,6 @@ struct AclStampInput {
 }
 
 #[derive(serde::Deserialize, Default)]
-#[cfg_attr(not(windows), allow(dead_code))]
 struct AclGrantInput {
     #[serde(default)]
     read: Vec<String>,
@@ -792,7 +842,6 @@ struct AclGrantInput {
 /// One per-path entry of `acl revoke --json` / `acl restore
 /// --sandbox-user-sid --json`.
 #[derive(serde::Serialize)]
-#[cfg_attr(not(windows), allow(dead_code))]
 struct AceReleaseEntry {
     path: String,
     status: &'static str,
@@ -858,21 +907,10 @@ enum WfpCmd {
     },
 }
 
-#[cfg(windows)]
-fn main() {
-    if let Err(e) = run() {
-        eprintln!("srt-win: error: {e:#}");
-        std::process::exit(1);
-    }
-}
-
-#[cfg(windows)]
-fn run() -> anyhow::Result<()> {
+fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
     use anyhow::{Context, anyhow};
     use serde_json::json;
     use srt_win::{sid, wfp};
-
-    let cli = Cli::parse();
 
     // Validate a caller-supplied SID string up front so a typo
     // surfaces as "invalid --<flag>" rather than an SDDL parse
@@ -909,7 +947,7 @@ fn run() -> anyhow::Result<()> {
             proxy_port_range,
             force,
         } => {
-            if let Some(code) = maybe_self_elevate()? {
+            if let Some(code) = maybe_self_elevate(args)? {
                 std::process::exit(code);
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
@@ -1055,7 +1093,7 @@ fn run() -> anyhow::Result<()> {
             sublayer_guid,
             keep_user,
         } => {
-            if let Some(code) = maybe_self_elevate()? {
+            if let Some(code) = maybe_self_elevate(args)? {
                 std::process::exit(code);
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
@@ -1129,7 +1167,7 @@ fn run() -> anyhow::Result<()> {
         Cmd::Group {
             sub: GroupCmd::Create { group, user_sid },
         } => {
-            if let Some(code) = maybe_self_elevate()? {
+            if let Some(code) = maybe_self_elevate(args)? {
                 std::process::exit(code);
             }
             if group.group_sid.is_some() {
@@ -1212,7 +1250,7 @@ fn run() -> anyhow::Result<()> {
         Cmd::Group {
             sub: GroupCmd::Delete { group },
         } => {
-            if let Some(code) = maybe_self_elevate()? {
+            if let Some(code) = maybe_self_elevate(args)? {
                 std::process::exit(code);
             }
             if group.group_sid.is_some() {
@@ -1231,7 +1269,7 @@ fn run() -> anyhow::Result<()> {
                     proxy_port_range,
                 },
         } => {
-            if let Some(code) = maybe_self_elevate()? {
+            if let Some(code) = maybe_self_elevate(args)? {
                 std::process::exit(code);
             }
             let gsid = resolve_group_sid(&group)?;
@@ -1315,7 +1353,7 @@ fn run() -> anyhow::Result<()> {
         Cmd::Wfp {
             sub: WfpCmd::Uninstall { sublayer_guid },
         } => {
-            if let Some(code) = maybe_self_elevate()? {
+            if let Some(code) = maybe_self_elevate(args)? {
                 std::process::exit(code);
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
@@ -1802,7 +1840,7 @@ fn run() -> anyhow::Result<()> {
             //
             // `target` is `required, num_args=1..` so non-empty.
             let exe = std::path::PathBuf::from(&target[0]);
-            let args = &target[1..];
+            let target_args = &target[1..];
 
             // Delete/rename fence — FALLBACK only. The primary
             // delete/rename protection is the parent-directory
@@ -2041,7 +2079,7 @@ fn run() -> anyhow::Result<()> {
             } else {
                 launch::run_lockdown(
                     &exe,
-                    args,
+                    target_args,
                     &launch::LaunchMode::SameUser {
                         group_sid: resolve_group_sid(&group)?,
                         skip_group_check,
@@ -2063,7 +2101,6 @@ fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn is_elevated() -> anyhow::Result<bool> {
     use anyhow::Context;
     use std::ffi::c_void;
@@ -2096,7 +2133,6 @@ fn is_elevated() -> anyhow::Result<bool> {
 /// [`maybe_self_elevate`], so this currently has no caller — it's
 /// retained as the non-interactive counterpart for code paths that
 /// must NOT pop a UAC prompt, hence `allow(dead_code)`.
-#[cfg(windows)]
 #[allow(dead_code)]
 fn require_elevated() -> anyhow::Result<()> {
     if is_elevated()? {
@@ -2126,8 +2162,13 @@ fn require_elevated() -> anyhow::Result<()> {
 /// install|uninstall` admin mutators call this too; their stderr is
 /// likewise informational. Read-only subcommands (`group status`,
 /// `wfp status`, `exec`) run as the broker and never self-elevate.
-#[cfg(windows)]
-fn maybe_self_elevate() -> anyhow::Result<Option<i32>> {
+///
+/// `args` is the post-sentinel-strip argv [`run_from_args`] was
+/// called with; the elevated parameters are rebuilt from `args[1..]`
+/// (NOT `std::env::args()`, which in a multicall embedder is the
+/// host's argv) with [`SRT_WIN_DISPATCH_ARG1`] prepended so the
+/// elevated child's dispatcher routes back into `srt-win`.
+fn maybe_self_elevate(args: &[OsString]) -> anyhow::Result<Option<i32>> {
     use anyhow::Context;
     use srt_win::launch::quote_arg;
     use srt_win::util::wstr;
@@ -2152,12 +2193,16 @@ fn maybe_self_elevate() -> anyhow::Result<Option<i32>> {
         )
     })?;
     let exe_w = wstr(exe_str);
-    // Rebuild the original argv (minus argv[0]) using
-    // CommandLineToArgvW-compatible quoting so the elevated
-    // child parses identically.
-    let params: String = std::env::args()
-        .skip(1)
-        .map(|a| quote_arg(&a))
+    // Rebuild `args[1..]` (the post-sentinel-strip argv
+    // `run_from_args` was given — not `std::env::args()`) with
+    // CommandLineToArgvW-compatible quoting so the elevated child
+    // parses identically. `lpFile` fixes the elevated child's
+    // argv[0] to the real exe path (ShellExecuteExW has no argv0
+    // slot), so prepend `SRT_WIN_DISPATCH_ARG1` so a multicall
+    // dispatcher in the elevated child routes back here. Harmless
+    // for the standalone binary (`run_from_args` strips it).
+    let params = std::iter::once(SRT_WIN_DISPATCH_ARG1.into())
+        .chain(args.iter().skip(1).map(|a| quote_arg(&a.to_string_lossy())))
         .collect::<Vec<_>>()
         .join(" ");
     let params_w = wstr(&params);
@@ -2214,11 +2259,54 @@ fn maybe_self_elevate() -> anyhow::Result<Option<i32>> {
     Ok(Some(code as i32))
 }
 
-#[cfg(not(windows))]
-fn main() {
-    // The clap-derived structs above keep `clap` referenced; just
-    // print the platform error.
-    let _ = <Cli as clap::CommandFactory>::command();
-    eprintln!("srt-win: Windows only");
-    std::process::exit(2);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `run_from_args` strips the `argv[1]` sentinel before clap so
+    /// the same argv shape works whether the embedder's dispatcher
+    /// or the standalone `srt-win.exe` is the entry. The CPWLW /
+    /// runas re-spawn hops are covered by smoke-exec.ps1; this
+    /// proves both shapes parse to the same `Cmd`. Uses
+    /// `try_parse_from` (not `run_from_args`) so the test doesn't
+    /// touch the host or `process::exit`.
+    #[test]
+    fn dispatch_sentinel_is_transparent_to_clap() {
+        let strip = |args: Vec<&str>| {
+            let mut v: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+            if v.get(1).map(OsString::as_os_str) == Some(SRT_WIN_DISPATCH_ARG1.as_ref()) {
+                v.remove(1);
+            }
+            v
+        };
+        // Multicall shape: argv[0] = host exe, argv[1] = sentinel.
+        let with = Cli::try_parse_from(strip(vec![
+            "host.exe",
+            SRT_WIN_DISPATCH_ARG1,
+            "user",
+            "status",
+        ]))
+        .expect("with-sentinel should parse");
+        assert!(matches!(
+            with.cmd,
+            Cmd::User {
+                sub: UserCmd::Status
+            }
+        ));
+        // Standalone shape: no sentinel.
+        let without = Cli::try_parse_from(strip(vec!["srt-win.exe", "user", "status"]))
+            .expect("without-sentinel should parse");
+        assert!(matches!(
+            without.cmd,
+            Cmd::User {
+                sub: UserCmd::Status
+            }
+        ));
+        // The sentinel is NOT a clap flag — without the strip, it
+        // must be rejected (otherwise a typo'd dispatcher silently
+        // works on `try_parse_from` while the real binary errors).
+        assert!(
+            Cli::try_parse_from(["srt-win.exe", SRT_WIN_DISPATCH_ARG1, "user", "status",]).is_err()
+        );
+    }
 }
