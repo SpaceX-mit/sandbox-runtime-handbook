@@ -139,9 +139,17 @@ pub fn spawn_runner(
         .ok_or_else(|| anyhow!("current_exe is not UTF-8"))?;
     let exe_w = wstr(exe_s);
     // `lpCommandLine` is parsed via `CommandLineToArgvW`; quote
-    // argv[0] so a path with spaces survives. `runner` is the only
-    // argument.
-    let mut cmdline_w = wstr(&format!("{} runner", quote_arg(exe_s)));
+    // argv[0] so a path with spaces survives. The
+    // `SRT_WIN_DISPATCH_ARG1` sentinel at argv[1] is what a
+    // multicall embedder's dispatcher routes on (`argv[0]` cannot be
+    // spoofed across CPWLW); `run_from_args` strips it before clap so
+    // the standalone binary accepts it harmlessly. `runner` is the
+    // only real argument.
+    let mut cmdline_w = wstr(&format!(
+        "{} {} runner",
+        quote_arg(exe_s),
+        crate::cli::SRT_WIN_DISPATCH_ARG1,
+    ));
     let user_w = wstr(username);
     let domain_w = wstr(".");
     let mut pw_w = wstr(password);
