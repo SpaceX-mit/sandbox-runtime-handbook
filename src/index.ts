@@ -61,6 +61,7 @@ export {
   grantWindowsAcl,
   revokeWindowsAcl,
   expandWindowsFsDenyPaths,
+  buildGitConfigEnv,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
   SRT_WIN_DISPATCH_ARG1,
 } from './sandbox/windows-sandbox-utils.js'

@@ -1361,12 +1361,20 @@ async function wrapWithSandbox(
  * macOS/Linux `argv` is `[binShell, '-c', <wrapWithSandbox result>]`
  * (proxy env is baked into that command) and `env` is the unchanged
  * `process.env`, so callers can spawn uniformly across platforms.
+ *
+ * @param cwd the working directory the caller will spawn the result
+ *   with. On Windows the child's cwd is whatever the caller passes
+ *   as the spawn `{cwd:}` option (there is no `--cwd` flag), and
+ *   the `safe.directory` git-config injection derives from this — so
+ *   pass the same value here as to `spawn({cwd})`. Defaults to
+ *   `process.cwd()`. Currently unused on macOS/Linux.
  */
 async function wrapWithSandboxArgv(
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
   abortSignal?: AbortSignal,
+  cwd?: string,
 ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }> {
   const platform = getPlatform()
 
@@ -1451,6 +1459,11 @@ async function wrapWithSandboxArgv(
       setEnvVars: credentialRestrictions.setEnvVars,
       denyRead: perExecDenyRead,
       denyWrite: perExecDenyWrite,
+      // safe.directory: cwd + the resolved session-level write
+      // grants — exactly the working-tree roots the sandbox user
+      // has MODIFY on and where git will see real-user-owned files.
+      cwd,
+      allowWrite: windowsFsStampedSet?.grantWrite,
       caCertPath: mitmCA?.trustBundlePath,
       binShell: parseWindowsBinShell(binShell),
       srtWin: customConfig?.windows?.srtWin
@@ -1890,6 +1903,7 @@ export interface ISandboxManager {
     binShell?: string,
     customConfig?: Partial<SandboxRuntimeConfig>,
     abortSignal?: AbortSignal,
+    cwd?: string,
   ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
