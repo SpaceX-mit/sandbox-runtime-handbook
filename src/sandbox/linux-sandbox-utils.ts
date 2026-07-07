@@ -1,4 +1,4 @@
-import shellquote from 'shell-quote'
+import { quote } from '../utils/shell-quote.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
@@ -48,6 +48,18 @@ export interface LinuxSandboxParams {
   writeConfig?: FsWriteRestrictionConfig
   /** Environment variable names to unset inside the sandbox (bwrap --unsetenv) */
   unsetEnvVars?: string[]
+  /** Environment variables to set inside the sandbox (bwrap --setenv NAME VALUE) */
+  setEnvVars?: Record<string, string>
+  /**
+   * Whole-file credential masks: bind fakePath (sentinel content) over
+   * realPath read-only so the sandbox reads the sentinel.
+   */
+  maskedFileBinds?: Array<{ realPath: string; fakePath: string }>
+  /**
+   * Host directory holding the fake files. Ro-bound over itself so the
+   * sandbox cannot write the bind sources even if allowWrite covers it.
+   */
+  maskedFileStoreDir?: string
   enableWeakerNestedSandbox?: boolean
   allowAllUnixSockets?: boolean
   binShell?: string
@@ -511,6 +523,8 @@ export async function initializeLinuxNetworkBridge(
   const socat = socatPath ?? 'socat'
   const socketId = randomBytes(8).toString('hex')
   const httpSocketPath = join(tmpdir(), `claude-http-${socketId}.sock`)
+  // Only allocated when ports differ; in the mux case the SOCKS side
+  // reuses httpSocketPath.
   const socksSocketPath = join(tmpdir(), `claude-socks-${socketId}.sock`)
 
   // Start HTTP bridge
@@ -545,40 +559,55 @@ export async function initializeLinuxNetworkBridge(
     throw new Error('Failed to start HTTP bridge process')
   }
 
-  // Start SOCKS bridge
-  const socksSocatArgs = [
-    `UNIX-LISTEN:${socksSocketPath},fork,reuseaddr`,
-    `TCP:localhost:${socksProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
-  ]
+  // SOCKS bridge: when the host serves both protocols on one port (the mux),
+  // a second socat to the same TCP target is redundant — reuse the HTTP
+  // bridge's process and socket path. Downstream consumers
+  // (LinuxNetworkBridgeContext, in-sandbox socat, cleanup) treat duplicate
+  // refs idempotently. A separate bridge is only spawned when the ports
+  // differ (external proxy override).
+  let socksBridgeProcess: ChildProcess
+  let socksSockPath: string
+  if (socksProxyPort === httpProxyPort) {
+    socksBridgeProcess = httpBridgeProcess
+    socksSockPath = httpSocketPath
+  } else {
+    socksSockPath = socksSocketPath
+    const socksSocatArgs = [
+      `UNIX-LISTEN:${socksSocketPath},fork,reuseaddr`,
+      `TCP:localhost:${socksProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
+    ]
 
-  logForDebugging(`Starting SOCKS bridge: ${socat} ${socksSocatArgs.join(' ')}`)
-
-  const socksBridgeProcess = spawn(socat, socksSocatArgs, {
-    stdio: 'ignore',
-  })
-
-  // Add error and exit handlers to monitor bridge health — registered
-  // before the !pid check for the same reason as the HTTP bridge above.
-  socksBridgeProcess.on('error', err => {
-    logForDebugging(`SOCKS bridge process error: ${err}`, { level: 'error' })
-  })
-  socksBridgeProcess.on('exit', (code, signal) => {
     logForDebugging(
-      `SOCKS bridge process exited with code ${code}, signal ${signal}`,
-      { level: code === 0 ? 'info' : 'error' },
+      `Starting SOCKS bridge: ${socat} ${socksSocatArgs.join(' ')}`,
     )
-  })
 
-  if (!socksBridgeProcess.pid) {
-    // Clean up HTTP bridge
-    if (httpBridgeProcess.pid) {
-      try {
-        process.kill(httpBridgeProcess.pid, 'SIGTERM')
-      } catch {
-        // Ignore errors
+    socksBridgeProcess = spawn(socat, socksSocatArgs, {
+      stdio: 'ignore',
+    })
+
+    // Add error and exit handlers to monitor bridge health — registered
+    // before the !pid check for the same reason as the HTTP bridge above.
+    socksBridgeProcess.on('error', err => {
+      logForDebugging(`SOCKS bridge process error: ${err}`, { level: 'error' })
+    })
+    socksBridgeProcess.on('exit', (code, signal) => {
+      logForDebugging(
+        `SOCKS bridge process exited with code ${code}, signal ${signal}`,
+        { level: code === 0 ? 'info' : 'error' },
+      )
+    })
+
+    if (!socksBridgeProcess.pid) {
+      // Clean up HTTP bridge
+      if (httpBridgeProcess.pid) {
+        try {
+          process.kill(httpBridgeProcess.pid, 'SIGTERM')
+        } catch {
+          // Ignore errors
+        }
       }
+      throw new Error('Failed to start SOCKS bridge process')
     }
-    throw new Error('Failed to start SOCKS bridge process')
   }
 
   // Wait for both sockets to be ready
@@ -595,7 +624,7 @@ export async function initializeLinuxNetworkBridge(
 
     try {
       // fs already imported
-      if (fs.existsSync(httpSocketPath) && fs.existsSync(socksSocketPath)) {
+      if (fs.existsSync(httpSocketPath) && fs.existsSync(socksSockPath)) {
         logForDebugging(`Linux bridges ready after ${i + 1} attempts`)
         break
       }
@@ -631,7 +660,7 @@ export async function initializeLinuxNetworkBridge(
 
   return {
     httpSocketPath,
-    socksSocketPath,
+    socksSocketPath: socksSockPath,
     httpBridgeProcess,
     socksBridgeProcess,
     httpProxyPort,
@@ -644,7 +673,7 @@ export async function initializeLinuxNetworkBridge(
  * multicall-binary prefix that dispatches on the ARGV0 env var.
  *
  * Returns a shell-ready string ending in a trailing space — callers append
- * shellquote.quote([shell, '-c', cmd]). Returns undefined when seccomp is
+ * quote([shell, '-c', cmd]). Returns undefined when seccomp is
  * unavailable (no argv0, no binary found).
  *
  * When argv0 is set, applyPath is used verbatim (no existence check); the
@@ -658,10 +687,10 @@ function resolveApplySeccompPrefix(
     if (!applyPath) {
       throw new Error('seccompConfig.argv0 requires seccompConfig.applyPath')
     }
-    return `ARGV0=${shellquote.quote([argv0])} ${shellquote.quote([applyPath])} `
+    return `ARGV0=${quote([argv0])} ${quote([applyPath])} `
   }
   const binary = getApplySeccompBinaryPath(applyPath)
-  return binary ? `${shellquote.quote([binary])} ` : undefined
+  return binary ? `${quote([binary])} ` : undefined
 }
 
 /**
@@ -680,7 +709,7 @@ function buildSandboxCommand(
   const shellPath = shell || 'bash'
   // Host filesystem is bind-mounted into the sandbox, so an explicit
   // socatPath resolves to the same binary inside bwrap.
-  const socat = shellquote.quote([socatPath ?? 'socat'])
+  const socat = quote([socatPath ?? 'socat'])
   const socatCommands = [
     `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
     `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
@@ -690,15 +719,14 @@ function buildSandboxCommand(
   // apply-seccomp runs after socat so socat can still create Unix sockets.
   if (applySeccompPrefix) {
     const applySeccompCmd =
-      applySeccompPrefix + shellquote.quote([shellPath, '-c', userCommand])
+      applySeccompPrefix + quote([shellPath, '-c', userCommand])
     const innerScript = [...socatCommands, applySeccompCmd].join('\n')
-    return `${shellPath} -c ${shellquote.quote([innerScript])}`
+    return `${shellPath} -c ${quote([innerScript])}`
   } else {
-    const innerScript = [
-      ...socatCommands,
-      `eval ${shellquote.quote([userCommand])}`,
-    ].join('\n')
-    return `${shellPath} -c ${shellquote.quote([innerScript])}`
+    const innerScript = [...socatCommands, `eval ${quote([userCommand])}`].join(
+      '\n',
+    )
+    return `${shellPath} -c ${quote([innerScript])}`
   }
 }
 
@@ -790,6 +818,8 @@ function pushReadDenyDirMounts(
 async function generateFilesystemArgs(
   readConfig: FsReadRestrictionConfig | undefined,
   writeConfig: FsWriteRestrictionConfig | undefined,
+  maskedFileBinds: Array<{ realPath: string; fakePath: string }> | undefined,
+  maskedFileStoreDir: string | undefined,
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
@@ -994,9 +1024,12 @@ async function generateFilesystemArgs(
   const readAllowPaths = (readConfig?.allowWithinDeny || []).map(p =>
     normalizePathForSandbox(p),
   )
-  // Files masked by --ro-bind /dev/null below. Used to filter denyWriteArgs so
-  // that --ro-bind <host> <host> doesn't undo the mask.
-  const maskedFiles = new Set<string>()
+  // Files masked by --ro-bind <source> <dest> below. Map of dest → source
+  // (/dev/null for read-deny, the sentinel fake for credential mask). Used
+  // to filter denyWriteArgs so that --ro-bind <host> <host> doesn't undo
+  // the mask, and to re-apply the correct source if a denyWrite ancestor
+  // bind re-exposes the dest.
+  const maskedFiles = new Map<string, string>()
   // Directories masked by --tmpfs below, in emission (shallow-first) order.
   // Used to filter denyWriteArgs the same way: a dir in both deny lists must
   // not get its host contents re-bound on top of its own tmpfs.
@@ -1021,7 +1054,10 @@ async function generateFilesystemArgs(
   // Always hide /etc/ssh/ssh_config.d to avoid permission issues with OrbStack
   // SSH is very strict about config file permissions and ownership, and they can
   // appear wrong inside the sandbox causing "Bad owner or permissions" errors
-  if (fs.existsSync('/etc/ssh/ssh_config.d')) {
+  //
+  // Skipped when readConfig is undefined (filesystem.disabled): no read
+  // policy means no implicit read denies either.
+  if (readConfig && fs.existsSync('/etc/ssh/ssh_config.d')) {
     readDenyPaths.push('/etc/ssh/ssh_config.d')
   }
 
@@ -1064,9 +1100,25 @@ async function generateFilesystemArgs(
       // bind destinations, so the deny bind lands on the resolved target.
       const denyDest = resolveSymlinkDenyDest(normalizedPath)
       args.push('--ro-bind', '/dev/null', denyDest)
-      maskedFiles.add(denyDest)
-      maskedFiles.add(normalizedPath)
+      maskedFiles.set(denyDest, '/dev/null')
+      maskedFiles.set(normalizedPath, '/dev/null')
     }
+  }
+
+  // Whole-file credential masks: same bind shape as a file read-deny,
+  // but the source is the sentinel-content fake instead of /dev/null.
+  // realPath was already normalized (tilde-expanded, realpath'd) by the
+  // caller; resolveSymlinkDenyDest covers the symlinked-credential case
+  // for the same reason as above. The fake's parent dir is explicitly
+  // ro-bound at the end of this function, so the bind source is never
+  // writable from inside the sandbox. Adding the dest to maskedFiles
+  // ensures a later denyWrite ro-bind over the same path doesn't undo
+  // the mask.
+  for (const { realPath, fakePath } of maskedFileBinds ?? []) {
+    const dest = resolveSymlinkDenyDest(realPath)
+    args.push('--ro-bind', fakePath, dest)
+    maskedFiles.set(dest, fakePath)
+    maskedFiles.set(realPath, fakePath)
   }
 
   // Emitting denyWrite last means these ro-binds layer on top of any write
@@ -1119,9 +1171,10 @@ async function generateFilesystemArgs(
       pushReadDenyDirMounts(args, tmpfsDir, allowedWritePaths, readAllowPaths)
     }
   }
-  // Same problem for read-denied files: the /dev/null mask landed before the
-  // denyWrite ancestor bind, so the real file is back. Re-apply the mask.
-  for (const maskedFile of maskedFiles) {
+  // Same problem for masked files: the mask landed before the denyWrite
+  // ancestor bind, so the real file is back. Re-apply the mask with its
+  // original source (/dev/null for read-deny, the fake for credential mask).
+  for (const [maskedFile, source] of maskedFiles) {
     if (emittedDenyWriteDests.some(dest => maskedFile.startsWith(dest + '/'))) {
       // maskedFiles holds both the symlink path and its resolved target so
       // the denyWrite skip-check above matches either. Re-emission must go
@@ -1131,10 +1184,20 @@ async function generateFilesystemArgs(
       // ancestor) or its own iteration re-emits it here.
       if (resolveSymlinkDenyDest(maskedFile) !== maskedFile) continue
       logForDebugging(
-        `[Sandbox Linux] Re-applying denyRead file mask re-exposed by denyWrite bind: ${maskedFile}`,
+        `[Sandbox Linux] Re-applying file mask re-exposed by denyWrite bind: ${maskedFile}`,
       )
-      args.push('--ro-bind', '/dev/null', maskedFile)
+      args.push('--ro-bind', source, maskedFile)
     }
+  }
+
+  // INVARIANT: the fake-file store directory must never be writable from
+  // inside the sandbox. If it were, a sandboxed process could plant a
+  // symlink at a fake path and a later host-side write() would follow it,
+  // or replace a fake's content so the bind exposes attacker bytes. Emit
+  // last so it overlays any earlier --bind that covers the store dir
+  // (e.g. allowWrite: ['/tmp'] when the store is under os.tmpdir()).
+  if (maskedFileStoreDir !== undefined) {
+    args.push('--ro-bind', maskedFileStoreDir, maskedFileStoreDir)
   }
 
   return args
@@ -1203,6 +1266,9 @@ export async function wrapCommandWithSandboxLinux(
     readConfig,
     writeConfig,
     unsetEnvVars,
+    setEnvVars,
+    maskedFileBinds,
+    maskedFileStoreDir,
     enableWeakerNestedSandbox,
     allowAllUnixSockets,
     binShell,
@@ -1219,10 +1285,13 @@ export async function wrapCommandWithSandboxLinux(
   // Determine if we have restrictions to apply
   // Read: denyOnly pattern - empty array means no restrictions
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
-  const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
+  const hasReadRestrictions =
+    (readConfig && readConfig.denyOnly.length > 0) ||
+    (maskedFileBinds !== undefined && maskedFileBinds.length > 0)
   const hasWriteRestrictions = writeConfig !== undefined
   const hasEnvRestrictions =
-    unsetEnvVars !== undefined && unsetEnvVars.length > 0
+    (unsetEnvVars !== undefined && unsetEnvVars.length > 0) ||
+    (setEnvVars !== undefined && Object.keys(setEnvVars).length > 0)
 
   // Check if we need any sandboxing
   if (
@@ -1300,8 +1369,13 @@ export async function wrapCommandWithSandboxLinux(
     // argument order, so SRT's own proxy plumbing vars survive even if a
     // caller lists one of them as a denied credential.
     if (hasEnvRestrictions) {
-      for (const name of unsetEnvVars) {
+      for (const name of unsetEnvVars ?? []) {
         bwrapArgs.push('--unsetenv', name)
+      }
+      // Masked credentials override the inherited real value with a
+      // sentinel; bwrap --setenv replaces any inherited value of NAME.
+      for (const [name, value] of Object.entries(setEnvVars ?? {})) {
+        bwrapArgs.push('--setenv', name, value)
       }
     }
 
@@ -1331,7 +1405,12 @@ export async function wrapCommandWithSandboxLinux(
 
         // Bind both sockets into the sandbox
         bwrapArgs.push('--bind', httpSocketPath, httpSocketPath)
-        bwrapArgs.push('--bind', socksSocketPath, socksSocketPath)
+        // When the mux serves both protocols, socksSocketPath is the same
+        // file as httpSocketPath; bwrap rejects a duplicate --bind of the
+        // same source→target.
+        if (socksSocketPath !== httpSocketPath) {
+          bwrapArgs.push('--bind', socksSocketPath, socksSocketPath)
+        }
 
         // Add proxy environment variables
         // HTTP_PROXY points to the socat listener inside the sandbox (port 3128)
@@ -1341,6 +1420,7 @@ export async function wrapCommandWithSandboxLinux(
           1080, // Internal SOCKS listener port
           caCertPath,
           proxyAuthToken,
+          writeConfig === undefined,
         )
         bwrapArgs.push(
           ...proxyEnv.flatMap((env: string) => {
@@ -1375,6 +1455,8 @@ export async function wrapCommandWithSandboxLinux(
     const fsArgs = await generateFilesystemArgs(
       readConfig,
       writeConfig,
+      maskedFileBinds,
+      maskedFileStoreDir,
       ripgrepConfig,
       mandatoryDenySearchDepth,
       allowGitConfig,
@@ -1438,17 +1520,13 @@ export async function wrapCommandWithSandboxLinux(
       )
       bwrapArgs.push(sandboxCommand)
     } else if (applySeccompPrefix) {
-      const applySeccompCmd =
-        applySeccompPrefix + shellquote.quote([shell, '-c', command])
+      const applySeccompCmd = applySeccompPrefix + quote([shell, '-c', command])
       bwrapArgs.push(applySeccompCmd)
     } else {
       bwrapArgs.push(command)
     }
 
-    const wrappedCommand = shellquote.quote([
-      bwrapPath ?? 'bwrap',
-      ...bwrapArgs,
-    ])
+    const wrappedCommand = quote([bwrapPath ?? 'bwrap', ...bwrapArgs])
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')

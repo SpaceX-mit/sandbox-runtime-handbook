@@ -37,6 +37,7 @@ export type {
 export type {
   FilterRequestCallback,
   RequestDecision,
+  MutateForwardedHeaders,
 } from './sandbox/request-filter.js'
 
 // Platform-specific utilities
@@ -46,28 +47,40 @@ export { type SandboxDependencyCheck } from './sandbox/linux-sandbox-utils.js'
 // Windows install/status API
 export {
   getSrtWinPath,
-  getWindowsGroupStatus,
+  resolveSrtWin,
   getWindowsWfpStatus,
+  verifyWindowsWfpEgress,
+  getWindowsSandboxUserStatus,
+  getWindowsSandboxCaCert,
+  windowsTrustCa,
   installWindowsSandbox,
   uninstallWindowsSandbox,
-  createWindowsGroup,
-  deleteWindowsGroup,
-  createWindowsWfp,
   windowsInstallInstructions,
-  DEFAULT_WINDOWS_GROUP_NAME,
+  stampWindowsAcl,
+  restoreWindowsAcl,
+  grantWindowsAcl,
+  revokeWindowsAcl,
+  expandWindowsFsDenyPaths,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
+  SRT_WIN_DISPATCH_ARG1,
 } from './sandbox/windows-sandbox-utils.js'
 export type {
-  WindowsGroupRef,
   WindowsInstallOptions,
   WindowsInstallResult,
-  WindowsGroupStatus,
-  WindowsGroupStatusResult,
   WindowsWfpStatus,
+  WindowsAclStampOptions,
+  WindowsAclGrantOptions,
+  WindowsAclAceOutcome,
   WindowsWfpStatusResult,
+  WindowsWfpVerifyResult,
+  WindowsSandboxUserStatus,
+  SrtWinSpawn,
 } from './sandbox/windows-sandbox-utils.js'
-export type { WindowsConfig } from './sandbox/sandbox-config.js'
-export { WindowsConfigSchema } from './sandbox/sandbox-config.js'
+export type { WindowsConfig, SrtWinConfig } from './sandbox/sandbox-config.js'
+export {
+  WindowsConfigSchema,
+  SrtWinConfigSchema,
+} from './sandbox/sandbox-config.js'
 
 // Utility functions
 export { getDefaultWritePaths } from './sandbox/sandbox-utils.js'

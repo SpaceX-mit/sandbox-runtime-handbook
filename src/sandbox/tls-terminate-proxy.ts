@@ -24,6 +24,7 @@ import type { MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
   type FilterRequestCallback,
+  type MutateForwardedHeaders,
 } from './request-filter.js'
 import { mintLeafCert, secureContextFor } from './mitm-leaf.js'
 import { stripHopByHop } from './parent-proxy.js'
@@ -115,6 +116,7 @@ export type TerminateTarget = {
 export function terminateAndForward(
   ca: MitmCA,
   filterRequest: FilterRequestCallback | undefined,
+  mutateHeaders: MutateForwardedHeaders | undefined,
   socket: Duplex,
   head: Buffer,
   target: TerminateTarget,
@@ -137,7 +139,7 @@ export function terminateAndForward(
   })
 
   inner.on('request', (req, res) => {
-    void forwardUpstream(filterRequest, req, res, target)
+    void forwardUpstream(filterRequest, mutateHeaders, req, res, target)
   })
   inner.on('tlsClientError', (err, sock) => {
     logForDebugging(
@@ -195,10 +197,19 @@ export function terminateAndForward(
 
 async function forwardUpstream(
   filterRequest: FilterRequestCallback | undefined,
+  mutateHeaders: MutateForwardedHeaders | undefined,
   req: IncomingMessage,
   res: ServerResponse,
   target: TerminateTarget,
 ): Promise<void> {
+  // req.url is the request-target verbatim. Inside a CONNECT tunnel almost
+  // every client sends origin-form (`/path?q`), but RFC 7230 §5.3.2 also
+  // permits absolute-form (`https://host/path`) and servers MUST accept it.
+  // Normalize to origin-form so concatenating onto `https://${host}` below
+  // yields a well-formed URL, and discard any client-supplied authority so
+  // the CONNECT-verified target stays authoritative (same rationale as the
+  // Host-header note below).
+  const path = originFormPath(req.url)
   let body: Readable = req
   if (filterRequest) {
     const ac = new AbortController()
@@ -226,7 +237,7 @@ async function forwardUpstream(
       filterRequest,
       req,
       res,
-      `https://${host}${req.url ?? '/'}`,
+      `https://${host}${path}`,
       ac.signal,
     )
     if (out === null) return
@@ -239,13 +250,18 @@ async function forwardUpstream(
   // correct verification under both Node and Bun.
   const fwdHeaders = stripHopByHop(req.headers)
   delete fwdHeaders.host
+  // Header mutation runs after the allow decision and before httpsRequest.
+  // The upstream TLS handshake (rejectUnauthorized defaults to true)
+  // completes before any HTTP bytes are written, so mutated headers never
+  // reach an unverified server.
+  mutateHeaders?.(fwdHeaders, target.hostname)
 
   // TODO(terminating-tls): honour parentProxy for the upstream leg.
   const upstream = httpsRequest(
     {
       host: target.hostname,
       port: target.port,
-      path: req.url,
+      path,
       method: req.method,
       headers: fwdHeaders,
       // We're a TLS-terminating proxy, not a trust boundary for the upstream
@@ -283,6 +299,18 @@ async function forwardUpstream(
 
   res.on('close', () => upstream.destroy())
   body.pipe(upstream)
+}
+
+function originFormPath(reqUrl: string | undefined): string {
+  const raw = reqUrl ?? '/'
+  if (raw.startsWith('/')) return raw
+  try {
+    const u = new URL(raw)
+    return `${u.pathname}${u.search}` || '/'
+  } catch {
+    // asterisk-form (`OPTIONS *`) or anything else non-absolute — pass through.
+    return raw
+  }
 }
 
 let sockSeq = 0

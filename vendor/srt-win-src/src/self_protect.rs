@@ -1,72 +1,92 @@
-//! Broker self-protection: rewrite the broker process's own DACL
-//! so the sandbox child cannot `OpenProcess(broker_pid,
-//! PROCESS_VM_*|CREATE_THREAD)`.
+//! Broker / runner self-protection: rewrite this process's own DACL
+//! so the sandbox child cannot `OpenProcess(our_pid,
+//! PROCESS_VM_*|CREATE_THREAD|CREATE_PROCESS)`.
 //!
 //! The DACL is replaced with an explicit ALLOW list scoped to SIDs
 //! the sandbox child does NOT have enabled in its token:
 //!
-//!   - `<group_sid>` — child has it deny-only
 //!   - SYSTEM (S-1-5-18) — child doesn't carry it
-//!   - BUILTIN\Admins — child has it deny-only
-//!   - OWNER RIGHTS = 0 — suppresses the owner's implicit
-//!     `READ_CONTROL|WRITE_DAC`, which would otherwise let the
-//!     child (same user = owner) `WRITE_DAC` the broker
+//!   - BUILTIN\Admins — child has it deny-only (LUA token)
+//!   - OWNER RIGHTS = `READ_CONTROL` — suppresses the owner's
+//!     implicit `WRITE_DAC`, which would otherwise let the child
+//!     (same user as the runner = owner) `WRITE_DAC` it
 //!
 //! `PROTECTED_DACL_SECURITY_INFORMATION` is required: without it
 //! the inherited "user has full access to their own process" ACE
 //! survives and the rewrite is a no-op for same-user children.
 //!
-//! Documented residual: another non-sandbox process belonging to
-//! the same user (e.g. Explorer) still has the group enabled and
-//! can therefore open the broker. That's intentional — the threat
-//! model is the sandbox child, not the rest of the user's session.
+//! Called by both the **broker** (real user, before
+//! `CreateProcessWithLogonW`) and the **runner** (`srt-sandbox`,
+//! before [`crate::launch::run_lockdown`]) — with DIFFERENT
+//! `extra_allow`:
+//!
+//!   - **broker** passes `Some(real-user-SID)`: the broker runs as
+//!     the real user; adding `<real-user>:FA` lets non-elevated
+//!     sibling tools (debuggers, task managers) open/query it. The
+//!     child runs as `srt-sandbox`, so this ACE does not match the
+//!     child.
+//!   - **runner** passes `None`: the runner runs as `srt-sandbox`
+//!     and so does the locked-down child. An `srt-sandbox:FA` ACE
+//!     here would let the child `OpenProcess(PROCESS_CREATE_PROCESS,
+//!     runner)` and parent-spawn under the runner's unrestricted
+//!     token — exactly what self-protection exists to close. The
+//!     runner DACL is therefore `[SY, BA, OW:RC]` only.
+//!
+//! The runner reaches itself via the `GetCurrentProcess()`
+//! pseudo-handle (which bypasses the DACL).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
 use std::mem::size_of;
-use windows::core::PWSTR;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Security::Authorization::{
-    ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo,
-    SetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_KERNEL_OBJECT, SetSecurityInfo,
 };
 use windows::Win32::Security::{
-    AddAccessAllowedAce, GetLengthSid, InitializeAcl, ACL, ACL_REVISION,
-    DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    ACL, ACL_REVISION, AddAccessAllowedAce, DACL_SECURITY_INFORMATION, GetLengthSid, InitializeAcl,
+    PROTECTED_DACL_SECURITY_INFORMATION,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, PROCESS_ALL_ACCESS};
+use windows::core::PWSTR;
 
 use crate::sid::LocalPsid;
 
-/// Owner-Rights well-known SID (`S-1-3-4`). An ALLOW ACE with mask 0
-/// on this SID overrides the implicit `READ_CONTROL|WRITE_DAC` that
-/// the object's owner otherwise gets.
+/// Owner-Rights well-known SID (`S-1-3-4`). An ALLOW ACE on this SID
+/// REPLACES the implicit `READ_CONTROL|WRITE_DAC` the object's owner
+/// otherwise gets. Mask is `READ_CONTROL` for consistency with
+/// [`crate::acl::Allow::OWNER_RIGHTS`]; mask-0 would also work here
+/// (this path uses kernel `SetSecurityInfo`, which doesn't drop
+/// mask-0 ACEs the way `SetNamedSecurityInfoW` does), but
+/// `READ_CONTROL` is the project convention.
 const SID_OWNER_RIGHTS: &str = "S-1-3-4";
+const READ_CONTROL: u32 = 0x0002_0000;
 const SID_SYSTEM: &str = "S-1-5-18";
 const SID_BUILTIN_ADMINS: &str = "S-1-5-32-544";
 
-/// Rewrite the current process's DACL to the broker-only pattern.
-/// Idempotent — safe to call once per `srt-win exec` invocation.
-pub fn install_broker_dacl(group_sid: &str) -> Result<()> {
+/// Rewrite the current process's DACL to SYSTEM + Admins +
+/// `OWNER_RIGHTS:READ_CONTROL`, plus an optional `extra_allow:FA`
+/// ACE. The broker passes its real-user SID so non-elevated
+/// real-user tools can still query/debug it; the runner passes
+/// `None` (see module doc). Idempotent — safe to call once per
+/// `srt-win exec` / `runner` invocation.
+pub fn install_broker_dacl(extra_allow: Option<&str>) -> Result<()> {
     // RAII over `ConvertStringSidToSidW` → freed via `LocalFree` on
     // drop.
-    let group = LocalPsid::from_string(group_sid)
-        .with_context(|| format!("parse group SID '{group_sid}'"))?;
     let system = LocalPsid::from_string(SID_SYSTEM)?;
     let admins = LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
     let owner_rights = LocalPsid::from_string(SID_OWNER_RIGHTS)?;
+    let extra = extra_allow.map(LocalPsid::from_string).transpose()?;
 
-    // (sid, mask) — first three get full access; OWNER_RIGHTS gets
-    // nothing. CI passes `group_sid == BUILTIN\Administrators`;
-    // dedup so we don't write a redundant ACE.
-    let mut aces: Vec<(windows::Win32::Security::PSID, u32)> = vec![
-        (group.as_psid(), PROCESS_ALL_ACCESS.0),
-        (system.as_psid(), PROCESS_ALL_ACCESS.0),
-    ];
-    if !group_sid.eq_ignore_ascii_case(SID_BUILTIN_ADMINS) {
-        aces.push((admins.as_psid(), PROCESS_ALL_ACCESS.0));
+    // (sid, mask) — SYSTEM/Admins (and the optional extra SID) get
+    // full access; OWNER_RIGHTS gets READ_CONTROL only.
+    let mut aces: Vec<(windows::Win32::Security::PSID, u32)> = Vec::with_capacity(4);
+    aces.push((system.as_psid(), PROCESS_ALL_ACCESS.0));
+    if let Some(ref e) = extra {
+        aces.push((e.as_psid(), PROCESS_ALL_ACCESS.0));
     }
-    aces.push((owner_rights.as_psid(), 0u32));
+    aces.push((admins.as_psid(), PROCESS_ALL_ACCESS.0));
+    aces.push((owner_rights.as_psid(), READ_CONTROL));
 
     // ACL size = header + Σ(ACE fixed prefix + SID body). The fixed
     // prefix of an ACCESS_ALLOWED_ACE is 8 bytes (Header 4 + Mask 4);
@@ -86,11 +106,9 @@ pub fn install_broker_dacl(group_sid: &str) -> Result<()> {
     let mut buf = vec![0u8; total];
     let acl = buf.as_mut_ptr() as *mut ACL;
     unsafe {
-        InitializeAcl(acl, total as u32, ACL_REVISION)
-            .context("InitializeAcl")?;
+        InitializeAcl(acl, total as u32, ACL_REVISION).context("InitializeAcl")?;
         for (s, mask) in &aces {
-            AddAccessAllowedAce(acl, ACL_REVISION, *mask, *s)
-                .context("AddAccessAllowedAce")?;
+            AddAccessAllowedAce(acl, ACL_REVISION, *mask, *s).context("AddAccessAllowedAce")?;
         }
         // PROTECTED strips inherited ACEs — without it the user
         // SID's default "full access to own process" inherited
@@ -105,9 +123,7 @@ pub fn install_broker_dacl(group_sid: &str) -> Result<()> {
             None,
         );
         if r.is_err() {
-            return Err(anyhow!(
-                "SetSecurityInfo(broker process DACL): {r:?}"
-            ));
+            return Err(anyhow!("SetSecurityInfo(broker process DACL): {r:?}"));
         }
     }
     // `buf` can drop here — `SetSecurityInfo` copies the ACL into
@@ -115,14 +131,11 @@ pub fn install_broker_dacl(group_sid: &str) -> Result<()> {
 
     // Diagnostic: read back and dump the DACL as SDDL so CI can
     // confirm exactly what's on the broker process. Gated on
-    // SANDBOX_RUNTIME_WIN_DEBUG — production callers (batch 03:
-    // one exec per user command) don't want a stderr line per
-    // command. CI sets the env var so E6 still records the SDDL.
+    // SANDBOX_RUNTIME_WIN_DEBUG — production callers (one exec per
+    // user command) don't want a stderr line per command.
     if std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_some() {
         match read_self_dacl_sddl() {
-            Some(sddl) => eprintln!(
-                "srt-win: self-protect applied (DACL: {sddl})"
-            ),
+            Some(sddl) => eprintln!("srt-win: self-protect applied (DACL: {sddl})"),
             None => eprintln!("srt-win: self-protect applied"),
         }
     }

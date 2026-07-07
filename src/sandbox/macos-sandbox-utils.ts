@@ -1,4 +1,4 @@
-import shellquote from 'shell-quote'
+import { quote } from '../utils/shell-quote.js'
 import { spawn } from 'child_process'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
@@ -37,6 +37,14 @@ export interface MacOSSandboxParams {
   writeConfig: FsWriteRestrictionConfig | undefined
   /** Environment variable names to unset for the sandboxed child (env -u) */
   unsetEnvVars?: string[]
+  /** Environment variables to set for the sandboxed child (env NAME=VALUE) */
+  setEnvVars?: Record<string, string>
+  /**
+   * Whole-file credential masks. SBPL cannot redirect reads, so on macOS
+   * these degrade to read-deny on realPath until the DYLD interposer
+   * lands. fakePath is unused here.
+   */
+  maskedFileBinds?: Array<{ realPath: string; fakePath: string }>
   ignoreViolations?: IgnoreViolationsConfig | undefined
   allowPty?: boolean
   allowGitConfig?: boolean
@@ -715,8 +723,10 @@ function generateSandboxProfile({
       )
     }
 
-    // Allow localhost TCP operations for the SOCKS proxy
-    if (socksProxyPort !== undefined) {
+    // Allow localhost TCP operations for the SOCKS proxy. Skip when it's
+    // the same port as the HTTP proxy (the mux serves both on one port);
+    // SBPL accepts duplicate allow clauses but there's no need to emit them.
+    if (socksProxyPort !== undefined && socksProxyPort !== httpProxyPort) {
       profile.push(
         `(allow network-bind (local ip "localhost:${socksProxyPort}"))`,
       )
@@ -784,9 +794,11 @@ export function wrapCommandWithSandboxMacOS(
     allowAllUnixSockets,
     allowLocalBinding,
     allowMachLookup,
-    readConfig,
+    readConfig: readConfigIn,
     writeConfig,
     unsetEnvVars,
+    setEnvVars,
+    maskedFileBinds,
     allowPty,
     allowGitConfig = false,
     enableWeakerNetworkIsolation = false,
@@ -794,13 +806,34 @@ export function wrapCommandWithSandboxMacOS(
     binShell,
   } = params
 
+  // SBPL cannot redirect a read to different bytes, so whole-file masking
+  // degrades to read-deny on macOS: the sandboxed process gets EPERM
+  // instead of the sentinel. The DYLD interposer (a later step) lifts
+  // this. Folding the masked paths into denyOnly here means the existing
+  // generateReadRules() emits the (deny file-read* …) rule unchanged.
+  let readConfig = readConfigIn
+  if (maskedFileBinds && maskedFileBinds.length > 0) {
+    logForDebugging(
+      '[Sandbox macOS] file mask degrades to deny on macOS until the ' +
+        'interposer lands',
+    )
+    readConfig = {
+      denyOnly: [
+        ...(readConfigIn?.denyOnly ?? []),
+        ...maskedFileBinds.map(b => b.realPath),
+      ],
+      allowWithinDeny: readConfigIn?.allowWithinDeny,
+    }
+  }
+
   // Determine if we have restrictions to apply
   // Read: denyOnly pattern - empty array means no restrictions
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
   const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
   const hasWriteRestrictions = writeConfig !== undefined
   const hasEnvRestrictions =
-    unsetEnvVars !== undefined && unsetEnvVars.length > 0
+    (unsetEnvVars !== undefined && unsetEnvVars.length > 0) ||
+    (setEnvVars !== undefined && Object.keys(setEnvVars).length > 0)
 
   // No sandboxing needed
   if (
@@ -837,6 +870,7 @@ export function wrapCommandWithSandboxMacOS(
     socksProxyPort,
     caCertPath,
     proxyAuthToken,
+    writeConfig === undefined,
   )
 
   // Seatbelt's (remote ip "localhost:*") filter — used for the
@@ -870,12 +904,19 @@ export function wrapCommandWithSandboxMacOS(
   // flags must precede the VAR=VALUE assignments so SRT's own proxy plumbing
   // vars survive even if a caller lists one of them as a denied credential.
   const unsetEnvArgs = (unsetEnvVars ?? []).flatMap(name => ['-u', name])
+  // Masked credentials override the inherited real value with a sentinel.
+  // Placed before the proxy plumbing assignments for the same precedence
+  // reason as the -u flags.
+  const setEnvArgs = Object.entries(setEnvVars ?? {}).map(
+    ([name, value]) => `${name}=${value}`,
+  )
 
   // Use `env` command to set environment variables - each VAR=value is a separate
-  // argument that shellquote handles properly, avoiding shell quoting issues
-  const wrappedCommand = shellquote.quote([
+  // argument that quote() escapes properly, avoiding shell quoting issues
+  const wrappedCommand = quote([
     'env',
     ...unsetEnvArgs,
+    ...setEnvArgs,
     ...proxyEnvArgs,
     '/usr/bin/sandbox-exec',
     '-p',
