@@ -23,7 +23,7 @@
 | 状态管理 | 已有 5 项 / 缺失 1 项 | ✅ 反超 sandbox-runtime |
 | 审计与观测 | 已有 2 项 / 缺失 4 项 | ⚠️ 部分缺失 |
 | 配置与 API | 已有 4 项 / 缺失 3 项 | ⚠️ 灵活度不足 |
-| 平台支持 | 已有 1 项 / 缺失 2 项 | ❌ 仅 Linux |
+| 平台支持 | 已有 1 项 / 缺失 0 项 | ✅ Linux (RISC-V) 唯一目标,无需跨平台 |
 
 **总结**:sbx-daemon 在**资源配额、状态管理、命名空间**上反超 srt;但在**文件系统精细化、网络隔离、审计观测**上差距明显。
 
@@ -591,14 +591,16 @@ pub fn annotate_stderr_with_violations(
 
 | 规格 | 状态 |
 |------|------|
-| **Linux(Bianbu 4.0.1, RISC-V)** | ✅ 主要目标 |
+| **Linux(Bianbu 4.0.1, RISC-V)** | ✅ 唯一目标,符合项目定位 |
 
-### 10.2 sbx-daemon **缺失** 的规格
+### 10.2 sbx-daemon **不需要** 的规格
 
-| 缺失规格 | sandbox-runtime 参考 | 价值 |
+| 不需规格 | sandbox-runtime 参考 | 说明 |
 |---------|---------------------|------|
-| ❌ **macOS 支持(Seatbelt)** | `macos-sandbox-utils.ts` 完整 | 跨平台需要 |
-| ❌ **x86_64 Linux 兼容** | N/A | 通用性需要 |
+| ⊘ **macOS 支持(Seatbelt)** | `macos-sandbox-utils.ts` 完整 | sbx-daemon 是嵌入式场景,仅服务 RISC-V Bianbu,不需要 macOS |
+| ⊘ **x86_64 Linux 兼容** | N/A | 目标平台固定,不需要通用性 |
+
+> **设计取向**:sbx-daemon 与 sandbox-runtime 的核心差异之一就是**平台范围**——srt 是"通用 Agent 沙箱库"(跨 3 平台),sbx-daemon 是"嵌入式 Bianbu 沙箱守护进程"(单一平台)。这不是缺陷,是**不同的产品定位**。
 
 ---
 
@@ -613,9 +615,8 @@ pub fn annotate_stderr_with_violations(
 | **P1-2** | stderr 自动标注违规 | ~30 LOC Rust | `annotateStderrWithSandboxFailures` |
 | **P2-1** | OOM 事件捕获 | ~50 LOC Rust | systemd cgroup notification |
 | **P2-2** | PID 1 化 | ~80 LOC Rust | Linux init 设计 |
-| **P3-1** | macOS 跨平台 | ~500 LOC Rust + Objective-C | `macos-sandbox-utils.ts` |
 
-**总体估算**:P0 完成约 530 LOC Rust + 测试,**2-3 周工作量**(假设单人全职)。
+**总体估算**:P0 完成约 530 LOC Rust + 测试,**2-3 周工作量**(假设单人全职)。**P3 阶段不需规划**(sbx-daemon 不做跨平台)。
 
 ---
 
