@@ -184,6 +184,306 @@ memcpy(dst + blen + 1, relPath, relPathLen)
 - 竞争的兄弟线程可以在 trap 与 read 之间 `unlink()` 路径 —— `path` 可能过时。我们接受这点:它是诊断通道,不是强制通道。
 - `kernel.yama.ptrace_scope=0` 允许被 ptrace 的进程彼此查看。user-notif 范围 `PR_SET_DUMPABLE=0` 在 inner init 上 + 嵌套 PID 命名空间缓解这个问题。
 
+### Node.js 端:`linux-violation-monitor.ts`
+
+C 端(`apply-seccomp`)负责拦截 syscall 并通过 socket 发 JSON 事件;**Node.js 端负责接收并判定哪些算"违规"**。这一半逻辑完全在 TypeScript 里,保持灵活性。
+
+#### 11.3.1 入口与配置
+
+```ts
+export function startLinuxSandboxViolationMonitor(
+  callback: SandboxViolationCallback,
+  opts: LinuxViolationMonitorOptions,
+): LinuxViolationMonitor
+```
+
+**关键参数**:
+- `callback`: 收到违规事件时的回调(实际是 `violationStore.addViolation`)
+- `allowWritePaths`: 用户配置的允许写路径(用于过滤"合法写")
+- `denyWritePaths`: 用户配置的禁止写路径(过滤"白名单里的禁区")
+- `ignoreViolations`: 噪声过滤规则
+
+#### 11.3.2 Socket 路径生成
+
+```ts
+const sockDir = mkdtempSync(join(tmpdir(), 'srt-obs-'))
+const sockPath = join(sockDir, `s${randomBytes(4).toString('hex')}.sock`)
+```
+
+**3 个设计要点**:
+
+1. **`mkdtemp` + 随机名**:避免命名冲突,支持多 sandbox 并发
+2. **临时目录**:每次启动创建,清理时 `rmSync` 删掉
+3. **`randomBytes`**:16 位随机后缀,防猜测
+
+#### 11.3.3 违规判定逻辑(核心算法)
+
+```ts
+const isDenied = (p: string): boolean => {
+  const norm = posix.normalize(p)         // 规范化:消除 ./ 和 ../
+
+  // 规则 1: 在 denyWrite 路径下 → 违规
+  if (denyWritePaths.some(d => underPrefix(norm, d))) return true
+
+  // 规则 2: 不在任何一个 allowWrite 路径下 → 违规
+  return !allowWritePaths.some(a => underPrefix(norm, a))
+}
+```
+
+**逻辑翻译**:
+
+> 给定路径 `p`:
+> 1. 先规范化(消除 `.` 和 `..`)
+> 2. 在 denyWrite 黑名单下 → **违规**(如 `~/.ssh` 即使在 allowWrite 里也违规)
+> 3. 不在 allowWrite 白名单下 → **违规**(如 `~/.aws`)
+> 4. 否则 → **合法**(在白名单内)
+
+**这是 bwrap mount 表的"镜像判定"**:
+
+| bwrap 行为 | violation-monitor 判定 |
+|-----------|----------------------|
+| `--ro-bind / /` | 不在 allowWrite 的拒绝 |
+| `--bind /allow /allow` | 在 allowWrite 的允许 |
+| `--tmpfs ~/.ssh` (在 allowWrite 内) | 在 denyWrite 的拒绝 |
+
+#### 11.3.4 噪声过滤(ignoreViolations)
+
+```ts
+const shouldIgnore = (path: string, command: string | undefined): boolean => {
+  if (wildcardPaths.some(w => path.includes(w))) return true
+  if (command) {
+    for (const [pattern, paths] of commandPatterns) {
+      if (command.includes(pattern) && paths.some(w => path.includes(w))) {
+        return true
+      }
+    }
+  }
+  return false
+}
+```
+
+**两种忽略规则**:
+
+1. **通配符模式** `ignoreViolations['*']`:所有命令里这些路径都忽略
+2. **按命令模式**:某个命令(如 `npm install`)里出现的某些路径(如 `node_modules`)忽略
+
+**为什么需要?** 真实场景会有大量"已知无害"的违规:
+- `npm install` 写 `node_modules/`(用户的 `allowWrite: ["."]` 没明确包含它)
+- `git` 写 `.git/objects/`
+- 各种工具的 cache 目录
+
+不忽略的话,违规事件会被噪音淹没。
+
+#### 11.3.5 事件处理管线
+
+```ts
+const handleEvent = (ev, encodedCommand) => {
+  // 1. 过滤 BPF filter 没装上的错误
+  if (ev.observe_init_error) { log...; return }
+
+  // 2. 过滤没有路径的事件
+  if (typeof ev.path !== 'string') return
+
+  // 3. 只能分类绝对路径
+  if (!ev.path.startsWith('/')) return
+
+  // 4. 不违规就不上报(只关心被拒绝的操作)
+  if (!isDenied(ev.path)) return
+
+  // 5. 解码命令(从 base64)
+  let command = encodedCommand ? decodeSandboxedCommand(encodedCommand) : undefined
+
+  // 6. 噪声过滤
+  if (shouldIgnore(ev.path, command)) return
+
+  // 7. 上报
+  callback({
+    line: `deny ${ev.syscall ?? 'syscall'} ${ev.path}`,
+    command, encodedCommand,
+    timestamp: new Date(),
+  })
+}
+```
+
+**事件流**:
+
+```
+JSON 事件进来
+   ↓ 解析
+过滤 1: BPF 装失败(系统层错误)
+   ↓
+过滤 2: 没有 path 字段
+   ↓
+过滤 3: 非绝对路径(无法分类)
+   ↓
+过滤 4: 不违规(合法写)  ← 这是宿主"镜像 bwrap"的核心
+   ↓
+过滤 5: 噪声(ignore 规则)
+   ↓
+构造 violation 事件
+   ↓
+callback → violationStore.addViolation
+```
+
+#### 11.3.6 Socket 服务实现
+
+```ts
+const server: Server = createServer(conn => {
+  let encodedCommand: string | undefined
+  const rl = createInterface({ input: conn })   // 按行读 JSON
+  rl.on('line', raw => {
+    let ev: ObserveEvent
+    try { ev = JSON.parse(raw) } catch { return }
+    if (ev.encodedCommand && encodedCommand === undefined) {
+      encodedCommand = ev.encodedCommand    // 第一行是命令 header
+    }
+    handleEvent(ev, encodedCommand ?? ev.encodedCommand)
+  })
+  conn.on('error', () => rl.close())
+  conn.on('close', () => rl.close())
+})
+```
+
+**几个关键设计**:
+
+1. **`readline` 按行解析**:JSON Lines 格式,简单可靠
+2. **第一行是 header**:带 `encodedCommand`(命令的 base64)
+3. **错误容忍**:`JSON.parse` 失败不崩,只丢掉这一行
+4. **连接关闭自动清理**:`rl.close()` 释放资源
+
+#### 11.3.7 Graceful Degradation
+
+```ts
+server.on('error', err => {
+  // listen 失败 → 优雅降级
+  observeSocketPath = undefined
+  resolveReady()
+})
+server.listen(sockPath, () => resolveReady())
+
+const stop = (): void => {
+  for (const s of sockets) s.destroy()
+  server.close()
+  try { rmSync(sockDir, { recursive: true, force: true }) } catch { /* best effort */ }
+}
+```
+
+**重要**:如果 socket 创建失败 → `observeSocketPath = undefined` → 上层跳过违规监控功能,**沙箱本身照常工作**。
+
+**这意味着 violation monitor 是"可选增强",不是关键路径**。即使它完全失败,安全保证(bwrap 自身)依然有效。
+
+#### 11.3.8 为什么用文件系统 socket 而不是抽象 socket?
+
+```ts
+// 文件系统 socket (sun_path)
+/tmp/srt-obs-xxxxx/random.sock
+
+// 抽象 socket (vsock / abstract ns)
+// @/srt-obs-xxxxx
+```
+
+**3 个原因**:
+
+1. **`--unshare-net`** 隔离网络命名空间 → 抽象 socket(基于网络 ns)失效
+2. **bwrap 关闭继承的 fd** → 抽象 socket 也走不通
+3. **文件系统 socket** 通过 `--bind` 穿透 mount 命名空间 → 唯一可行方案
+
+#### 11.3.9 为什么"合法写也上报,宿主再过滤"?
+
+```ts
+// apply-seccomp 上报所有写意图
+// 宿主 isDenied() 判定后才算 violation
+```
+
+**为什么不直接在 apply-seccomp 里过滤?**
+
+| 维度 | apply-seccomp 内过滤 | 宿主过滤 |
+|------|---------------------|---------|
+| **逻辑复杂度** | C 代码里写路径匹配 | Node.js 灵活 |
+| **配置更新** | 需要重新编译 ELF | 直接读配置文件 |
+| **ignore 规则** | 难表达(正则/glob) | JS 字符串操作 |
+| **跨平台一致性** | Linux 单独实现 | 跟 macOS 同一套逻辑 |
+
+**结论**:**只把决策逻辑放在宿主的 Node.js 里**,保持 C 代码的纯粹。
+
+#### 11.3.10 反复强调的安全警告
+
+```ts
+// bwrap's mount table is the only enforcement boundary;
+// the violation events emitted here are DIAGNOSTIC HINTS and
+// must never gate a policy decision.
+```
+
+**翻译**:
+
+> bwrap 的 mount 表才是**唯一**的强制边界。这些违规事件只是**诊断提示**,**绝不能**用来做策略决策。
+
+**为什么?**
+
+- 路径是攻击者控制的(从进程内存读)
+- 可能有竞态(读路径时文件已被删)
+- 事件可能被丢失(socket 满/进程被杀)
+
+**含义**:即使 violation-monitor 报告"未违规",也**不能信任**这个报告。**唯一可信的是 bwrap 本身**。
+
+#### 11.3.11 完整数据流
+
+```
+  ┌──────────────────────────────────────────────────────────┐
+  │ 沙箱内 worker 进程(如 bash)                              │
+  │   试图 write("/etc/passwd", ...)                         │
+  └────────────────────────┬─────────────────────────────────┘
+                           │ syscall: openat(O_WRONLY)
+                           ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │ Linux Kernel (BPF filter)                                │
+  │   检测到 SECCOMP_RET_USER_NOTIF 标记的 syscall            │
+  │   暂停 worker,通知 apply-seccomp supervisor              │
+  └────────────────────────┬─────────────────────────────────┘
+                           │ notification fd
+                           ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │ apply-seccomp supervisor (用户态)                        │
+  │   1. 读 worker 内存: path = "/etc/passwd"                │
+  │   2. 决定: 不在 allowWrite → 拒绝 → SECCOMP_RET_KILL    │
+  │   3. 写事件到 socket: {"syscall":"openat",               │
+  │                        "path":"/etc/passwd"}              │
+  └────────────────────────┬─────────────────────────────────┘
+                           │ Unix socket JSON
+                           ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │ 宿主 linux-violation-monitor (Node.js)                   │
+  │   1. readline 解析 JSON                                  │
+  │   2. isDenied("/etc/passwd") → true (不在白名单)         │
+  │   3. shouldIgnore → false                                │
+  │   4. callback(violation)                                 │
+  └────────────────────────┬─────────────────────────────────┘
+                           │ in-memory call
+                           ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │ SandboxViolationStore                                    │
+  │   violations.push(event) → notifyListeners()             │
+  └────────────────────────┬─────────────────────────────────┘
+                           │ subscriber callback
+                           ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │ 宿主 UI / Claude Code / 日志系统                         │
+  │   "User tried to write /etc/passwd" → 显示给用户          │
+  └──────────────────────────────────────────────────────────┘
+```
+
+#### 11.3.12 与 macOS 实现的对比
+
+| 维度 | macOS (Seatbelt) | Linux (USER_NOTIF) |
+|------|-----------------|-------------------|
+| **机制** | 系统原生 `log stream` | 内核 BPF + 用户态 supervise |
+| **报告内容** | **只报被拒绝的**(denials) | **报所有写意图**(attempts) |
+| **判定逻辑** | 内核做 | **宿主做**(mirror bwrap) |
+| **实现复杂度** | 简单(读 log) | 复杂(USER_NOTIF 难调) |
+| **可靠性** | 高(内核保证) | 中(可能有事件丢失) |
+
+**Linux 实现更复杂的原因**:Seatbelt 自带 `log stream` 这个神器,Linux 没有等价物。USER_NOTIF 是 Linux 5.0 引入的"近亲"机制,但**需要用户态 supervise loop**,所以 sandbox-runtime 自己实现了 `apply-seccomp` 这个静态二进制。
+
 ## 11.4 Windows —— 暂无违规监控(v1)
 
 `FWPM_LAYER_ALE_AUTH_CONNECT` 不携带 callout 驱动钩子(为此需要内核驱动)。被阻的连接仅返回 `WSAECONNABORTED`;载体侧应用看到连接错误。

@@ -466,7 +466,7 @@ async function runComplexTask(command: string) {
 
 | 文档 | 内容 | 与本文档的关系 |
 |------|------|---------------|
-| `11-violation-monitoring.md` | 违规监控设计 | **深入**:本文档提及但未展开 |
+| `11-violation-monitoring.md` | 违规监控设计 | **深入**:本文档作为概念性提及,详细实现见 ch.11 第 11.3 节(含 C 端 BPF 机制)和 11.3.1-11.3.12 子节(Node.js 端 `linux-violation-monitor.ts` 实现) |
 | `16-bwrap-for-agent-capabilities.md` | bwrap 能力总览 | 前置阅读:理解沙箱机制 |
 | `17-agent-tool-strategy-and-sandbox-differentiation.md` | 工具策略 | **强相关**:本文档是它的"数据通道"补充 |
 | `02-system-architecture.md` | 系统架构 | 互补:本文档聚焦通信层 |
