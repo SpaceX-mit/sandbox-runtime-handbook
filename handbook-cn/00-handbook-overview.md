@@ -21,6 +21,9 @@
 | 13 | security-model.md                           | 威胁模型、安全不变式、已知限制                                                      |
 | 14 | implementation-roadmap.md                   | 分阶段实施计划                                                                      |
 | 15 | glossary.md                                 | 术语表(SBPL、ACE、BPF、CRL 等)                                                      |
+| 16 | bwrap-for-agent-capabilities.md             | Linux 下 bwrap 怎么工作 + 为 Agent 提供的能力总览(端到端入门/串讲)                   |
+| 17 | agent-tool-strategy-and-sandbox-differentiation.md | Agent 如何按工具类型(只读/文件操作/命令)差异化配置沙箱(工具层策略)            |
+| 18 | sandbox-to-agent-data-reclaim.md            | 沙箱 → Agent 的数据回收模式:6 种通道(stdout / 共享挂载 / Unix socket / JSON / 哨兵文件 / MCP) |
 | 19 | architecture-alternatives-srt-vs-sal.md     | 架构对照:本项目 vs 可插拔 Sandbox Abstraction Layer(SAL)——给自研 agent 系统的设计者 |
 
 ## 配套参考文件
@@ -53,3 +56,36 @@
 ## 何为要读第 19 章
 
 第 19 章不是 srt 的说明,而是**替代架构的对照**——给正在自研 agent 系统的设计者看的。当你的需求从"单一 OS 原语"扩展到"多后端可插拔 + workspace/capability/resource 分层管理 + snapshot/fork" 时,应该考虑 SAL 架构;srt 提供的是该方向的领域知识而**非**架构模板。如果你正在权衡"SAL 还是 srt",先读第 19 章;否则按 1-15 顺序阅读即可。
+
+## Agent + Sandbox 架构闭环(第 16—18 章)
+
+第 16、17、18 章是面向 **Agent 设计者**的专门套件,依次回答三个互为补充的问题:
+
+| 章节 | 视角 | 核心问题 | 读者产出 |
+|------|------|---------|---------|
+| **ch.16** | 基础设施(自底向上) | 沙箱能做什么? | 了解 bwrap 机制、知道 srt 提供哪些能力 |
+| **ch.17** | 工具策略(自顶向下) | Agent 该怎么用沙箱? | 设计工具 schema、配置最小特权、构造 ToolResult |
+| **ch.18** | 通信层(横向) | 数据怎么回来? | 选择合适的回收通道(stdout / 文件 / socket / MCP) |
+
+三章合在一起构成完整的 **Agent + Sandbox 架构闭环**:
+
+```
+       ch.17: 工具策略
+       (Agent 该怎么调)
+            ↓                ↑
+   wrapWithSandboxArgv()         │ stdout/socket/...
+            ↓                │
+       ch.16: 沙箱机制
+       (bwrap/seccomp 怎么跑)
+            ↓ 产生数据
+       ch.18: 数据回收
+       (数据怎么回到 Agent)
+            → 返回 ch.17
+```
+
+**阅读路径建议**:
+
+- **理解沙箱能力** → 先读 ch.16
+- **设计 Agent 工具集成** → 跳 ch.17 + ch.18
+- **架构决策/选型** → 三章都读
+- **实现细节/参数级** → 返回 ch.06(文件系统)、ch.11(违规监控,含 11.3.1—11.3.12 子节详述 Node.js 端 `linux-violation-monitor.ts`)
