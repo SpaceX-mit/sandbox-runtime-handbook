@@ -21,6 +21,7 @@
 | 13 | security-model.md                           | 威胁模型、安全不变式、已知限制                                                      |
 | 14 | implementation-roadmap.md                   | 分阶段实施计划                                                                      |
 | 15 | glossary.md                                 | 术语表(SBPL、ACE、BPF、CRL 等)                                                      |
+| 19 | architecture-alternatives-srt-vs-sal.md     | 架构对照:本项目 vs 可插拔 Sandbox Abstraction Layer(SAL)——给自研 agent 系统的设计者 |
 
 ## 配套参考文件
 
@@ -48,3 +49,7 @@
 - **不**试图对特定工具具备策略感知能力。每个嵌入方(`claude-code`、MCP server 等)各自维护高层策略;srt 是它们共享的 OS 级强制原语。
 - **不**提供多租户编排器。每个进程获得自己的沙箱;管理器是单进程、单租户的。
 - **不**附带 seccomp 策略语言。`network.filterRequest` 是逐请求 HTTP 拦截的唯一逃生口,库的使用方自行负责匹配规则。
+
+## 何为要读第 19 章
+
+第 19 章不是 srt 的说明,而是**替代架构的对照**——给正在自研 agent 系统的设计者看的。当你的需求从"单一 OS 原语"扩展到"多后端可插拔 + workspace/capability/resource 分层管理 + snapshot/fork" 时,应该考虑 SAL 架构;srt 提供的是该方向的领域知识而**非**架构模板。如果你正在权衡"SAL 还是 srt",先读第 19 章;否则按 1-15 顺序阅读即可。
